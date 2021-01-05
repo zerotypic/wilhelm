@@ -9,6 +9,7 @@ from . import event
 from . import util
 from .util import TYPECHECK, TypecheckExn
 from .util.immutable import immdict
+from .util import asyncutils
 
 class Exn(Exception): pass
 class InvalidBasenameExn(Exn): pass
@@ -30,14 +31,29 @@ _SUFFIX_DELIMITER = "$$"
 
 # QNameEvents are always tagged by the name of their context.
 class QNameEvent(event.Event):
+    '''Events related to qnames.
+
+    If you want to handle all instances where a qname is renamed,
+    you must listen for:
+    - RenameEvent emitted by the qname
+    - ChildMoveEvent emitted by the current *parent* (i.e. you must
+    register as a relay event observer)
+    
+    If you want to handle all instances where a qname's list of children
+    changes, you must listen for:
+    - AddChildEvent emitted by the qname
+    - RemoveChildEvent emitted by the qname
+    - ChildMoveEvent emitted by the qname
+
+    '''
     def __init__(self, ctx, **kwargs):
         super().__init__(tag=ctx.name, **kwargs)
         self.ctx = ctx
     #enddef
 #endclass
 
-# This event gets triggered after the child is added.
 class AddChildEvent(QNameEvent):
+    '''Triggered after the child is added.'''
     def __init__(self, ctx, parent, childname, **kwargs):
         super().__init__(ctx, **kwargs)
         self.parent = parent
@@ -45,8 +61,8 @@ class AddChildEvent(QNameEvent):
     #enddef
 #endclass
 
-# This event gets triggered before the child is removed.
 class RemoveChildEvent(QNameEvent):
+    '''Triggered before the child is removed.'''
     def __init__(self, ctx, parent, childname, **kwargs):
         super().__init__(ctx, **kwargs)
         self.parent = parent
@@ -54,16 +70,16 @@ class RemoveChildEvent(QNameEvent):
     #enddef
 #endclass
 
-# This event gets triggered before a qname is orphaned (deleted)
 class OrphanEvent(QNameEvent):
+    '''Triggered before a qname is orphaned (deleted).'''
     def __init__(self, ctx, qname, **kwargs):
         super().__init__(ctx, **kwargs)
         self.qname = qname
     #enddef
 #endclass
 
-# This event get triggered after a qname is renamed.
 class RenameEvent(QNameEvent):
+    '''Triggered after a qname is renamed.'''
     def __init__(self, ctx, qname, old_name, new_name, **kwargs):
         super().__init__(ctx, **kwargs)
         self.qname = qname
@@ -72,12 +88,17 @@ class RenameEvent(QNameEvent):
     #enddef
 #endclass
 
-class ChangeParentEvent(QNameEvent):
-    def __init__(self, ctx, qname, old_parent, new_parent, **kwargs):
+class ChildMoveEvent(QNameEvent):
+    '''Triggered after a qname is moved from one parent to another, and
+    optionally renamed.
+    This event will be emitted by both the old parent and the new parent.'''
+    def __init__(self, ctx, qname, old_parent, new_parent, old_name, new_name, **kwargs):
         super().__init__(ctx, **kwargs)
         self.qname = qname
         self.old_parent = old_parent
         self.new_parent = new_parent
+        self.old_name = old_name
+        self.new_name = new_name
     #enddef
 #endclass
 
@@ -151,27 +172,32 @@ class Root(BRG_PARENT.Relay, BRG_CHILDREN.Relay):
         return new_child           
     #enddef
 
-    def remove_child(self, child_basename):
+    async def remove_child_async(self, child_basename):
         '''Removes the child with basename 'child_basename' from this
         namespace. The child object becomes an orphaned QName and cannot
         be used.'''
         if child_basename in self._children:
             child = self._children[child_basename]
-            self._orphan_child(child)
+            await self._orphan_child(child)
         else:
             raise NotFoundExn("Cannot find child '{}' to delete.".format(child_basename))
         #endif        
     #enddef
 
-    def _orphan_child(self, child):
+    def remove_child(self, child_basename):
+        return asyncutils.run_task_till_done(self.remove_child_async(child_basename))
+    #enddef
+    
+    async def _orphan_child(self, child):
+
+        # Begin orphaning from leaf nodes upwards.
+        children = list(child.children.values())
+        for c in children: await child._orphan_child(c)
+
         # Wait for event handlers to finish before we remove the child, so
         # they can access the child before it gets orphaned.
-        self.emit_event_and_wait(RemoveChildEvent, self._ctx, self, child._basename)
-
-        children = list(child.children.values())
-        for c in children: child._orphan_child(c)
-
-        child.emit_event_and_wait(OrphanEvent, child._ctx, child)
+        await self.emit_event_and_wait(RemoveChildEvent, self._ctx, self, child._basename)
+        await child.emit_event_and_wait(OrphanEvent, child._ctx, child)
         
         child_basename = child._basename
         self._remove_child(child)
@@ -192,31 +218,36 @@ class Root(BRG_PARENT.Relay, BRG_CHILDREN.Relay):
         #endif
         new_child._ctx = self._ctx
         old_parent = new_child._parent
-        # Wait for RemoveChild event handlers to complete before
-        # continuing.
-        old_parent.emit_event_and_wait(RemoveChildEvent, old_parent._ctx,
-                                       old_parent, new_child._basename)
-        old_parent._remove_child(new_child)
-        rename_event_info = None
-        if new_name != None and new_name != new_child._basename:
+        old_name = new_child._basename
+
+        # Check for duplicate names before we make any changes.
+        if new_name != None and new_name != old_name:
             self._check_duplicate_name(new_name)
-            # We delay sending the rename event till after the child has
-            # been properly adopted, to prevent event handlers from seeing
-            # a transient state.
-            rename_event_info = (new_child._basename, new_name)
-            new_child._basename = new_name
         #endif
+        
+        old_parent._remove_child(new_child)
+        if new_name != None: new_child._basename = new_name
         new_child._parent = self
         self._add_child(new_child)
-        if rename_event_info != None:
-            # We can send the rename event now as the child has been
-            # properly adopted, with a new name.
-            (old_name, new_name) = rename_event_info
-            new_child.emit_event(RenameEvent, new_child._ctx, new_child, old_name, new_name)
-        #endif
-        new_child.emit_event(ChangeParentEvent, new_child._ctx, new_child, old_parent, self)
-        self.emit_event(AddChildEvent, self._ctx, self, new_child._basename)
+
+        # Emit events.
+        old_parent.emit_event(ChildMoveEvent,
+                              old_parent._ctx,
+                              new_child,
+                              old_parent,
+                              self,
+                              old_name,
+                              new_name)
+        self.emit_event(ChildMoveEvent,
+                        self._ctx,
+                        new_child,
+                        old_parent,
+                        self,
+                        old_name,
+                        new_name)
+
         return new_child
+
     #enddef
 
     def _rename_child(self, old_name, new_name):
@@ -231,9 +262,13 @@ class Root(BRG_PARENT.Relay, BRG_CHILDREN.Relay):
         child.emit_event(RenameEvent, child._ctx, child, old_name, new_name)
     #enddef
     
-    def clear(self):
+    async def clear_async(self):
         children = list(self._children.values())
-        for c in children: self._orphan_child(c)
+        for c in children: await self._orphan_child(c)
+    #enddef
+
+    def clear(self):
+        asyncutils.run_task_till_done(self.clear_async())
     #enddef
     
     def search(self, query, **kwargs):
@@ -548,7 +583,9 @@ class Test(event.EventTestCase):
         super().tearDown()
     #enddef
 
-    def assertEventsMatch(self, events, specs, includes_bearings=False):
+    def assertEventsMatch(self, events, specs,
+                          includes_bearings=False,
+                          include_origin=False):
         # specs should be a list of 'spec' objects, where a spec is of the
         # form: (<event type>, <property list>),
         # or ((<bearing>, <event type>), <property list>) if
@@ -562,29 +599,31 @@ class Test(event.EventTestCase):
         # To perform the match, we sort the event list and the spec list.
 
         def get_event_properties(ev):
-            return [(k, v) for (k, v) in ev.__dict__.items()
-                    if not k.startswith("_") and not k == "ctx"]
+            props = [(k, v) for (k, v) in ev.__dict__.items()
+                     if not k.startswith("_") and not k == "ctx"]
+            if include_origin: props.append(("origin", ev.origin))
+            return props
         #enddef
 
         if includes_bearings:
             def event_info(bev): return ((bev[0], type(bev[1])), get_event_properties(bev[1]))
             def event_sort_key(bev):
                 ((bearing, evtype), props) = event_info(bev)
-                return (bearing, repr(evtype), props)
+                return (bearing, repr(evtype), repr(props))
             #enddef
             def spec_sort_key(spec):
                 ((bearing, event), props) = spec
-                return ((bearing, repr(event)), props)
+                return ((bearing, repr(event)), repr(props))
             #enddef
         else:
             def event_info(ev): return (type(ev), get_event_properties(ev))
             def event_sort_key(ev):
                 (evtype, props) = event_info(ev)
-                return (repr(evtype), props)
+                return (repr(evtype), repr(props))
             #enddef
             def spec_sort_key(spec):
                 (event, props) = spec
-                return (repr(event), props)
+                return (repr(event), repr(props))
             #enddef
         #endif
 
@@ -968,11 +1007,17 @@ class Test(event.EventTestCase):
             self.assertIsInstance(ev, RemoveChildEvent)
             self.assertEqual(ev.parent, foo)
             self.assertEqual(ev.childname, "ding")
+            # Try to access the basename of the child that is to be
+            # removed, to confirm it has not yet been orphaned.
+            self.assertEqual(foo_ding.basename, "ding")
         #enddef
         @self.check_called
         def orphan_handler(ev):
             self.assertIsInstance(ev, OrphanEvent)
             self.assertEqual(ev.qname, foo_ding)
+            # Try to access the basename of the child that is to be
+            # removed, to confirm it has not yet been orphaned.
+            self.assertEqual(foo_ding.basename, "ding")
         #enddef
         
         manager.reset()
@@ -982,22 +1027,29 @@ class Test(event.EventTestCase):
         self.wait_for_events()
         self.assertTrue(remove_handler.was_called())
         self.assertTrue(orphan_handler.was_called())
-
+        
         # Check cascading remove events in children
         removed_children = []
-        @self.check_called
+        orphans = []
         def remove_handler(ev):
             self.assertIsInstance(ev, RemoveChildEvent)
             removed_children.append((ev.parent, ev.childname))
         #enddef
+        def orphan_handler(ev):
+            self.assertIsInstance(ev, OrphanEvent)
+            orphans.append(ev.qname.basename)
+        #enddef
         manager.reset()
         manager.register_handler(RemoveChildEvent, remove_handler)
+        manager.register_handler(OrphanEvent, orphan_handler)
         bar.remove_child("boing")
         self.wait_for_events()
         self.assertCountEqual(removed_children,
                               [(bar_boing, "baz"),
                                (bar_boing, "quux"),
                                (bar, "boing")])
+        self.assertCountEqual(orphans,
+                              ["baz", "quux", "boing"])
 
         # Check rename event.
         @self.check_called
@@ -1015,7 +1067,6 @@ class Test(event.EventTestCase):
 
         # Check events for node adoption
         events = []
-        @self.check_called
         def handler(ev):
             events.append(ev)
         #enddef
@@ -1023,18 +1074,22 @@ class Test(event.EventTestCase):
         manager.register_handler(QNameEvent, handler)
         baz_bong.parent = foo
         self.wait_for_events()
-        self.assertTrue(handler.was_called())
         self.maxDiff = None
         self.assertEventsMatch(
             events,
-            ((RemoveChildEvent, (("parent", baz),
-                                 ("childname", "bong"))),
-             (AddChildEvent, (("parent", foo),
-                              ("childname", "bong"))),
-             (ChangeParentEvent, (("qname", baz_bong),
-                                  ("old_parent", baz),
-                                  ("new_parent", foo))),
-            )
+            ((ChildMoveEvent, (("origin", baz),
+                               ("qname", baz_bong),
+                               ("old_parent", baz),
+                               ("new_parent", foo),
+                               ("old_name", "bong"),
+                               ("new_name", None))),
+             (ChildMoveEvent, (("origin", foo),
+                               ("qname", baz_bong),
+                               ("old_parent", baz),
+                               ("new_parent", foo),
+                               ("old_name", "bong"),
+                               ("new_name", None))),
+            ), include_origin=True
         )
 
         # Check events for node move that is just a rename
@@ -1067,31 +1122,20 @@ class Test(event.EventTestCase):
         self.assertTrue(handler.was_called())
 
         self.assertEventsMatch(events, (
-            (RemoveChildEvent, (("parent", baz),
-                                ("childname", "quux"))),
-            (RenameEvent, (("qname", baz_quux),
-                           ("old_name", "quux"),
-                           ("new_name", "boing"))),
-            (AddChildEvent, (("parent", foo),
-                             ("childname", "boing"))),
-            (ChangeParentEvent, (("qname", baz_quux),
-                                 ("old_parent", baz),
-                                 ("new_parent", foo))),
-        ))
-        
-        # XXX: STOPPED HERE
-        # Change the code below to use self.assertEventsMatch(), and cater
-        # for new ChangeParentEvent's.
-
-        # self.assertEqual(len(events), 2)
-        # (rm_ev, add_ev) = events
-        # self.assertIsInstance(rm_ev, RemoveChildEvent)
-        # self.assertEqual(rm_ev.parent, baz)
-        # self.assertEqual(rm_ev.childname, "quux")
-        # self.assertIsInstance(add_ev, AddChildEvent)
-        # self.assertEqual(add_ev.parent, foo)
-        # self.assertEqual(add_ev.childname, "boing")
-
+            (ChildMoveEvent, (("origin", baz),
+                              ("qname", baz_quux),
+                              ("old_parent", baz),
+                              ("new_parent", foo),
+                              ("old_name", "quux"),
+                              ("new_name", "boing"))),
+            (ChildMoveEvent, (("origin", foo),
+                              ("qname", baz_quux),
+                              ("old_parent", baz),
+                              ("new_parent", foo),
+                              ("old_name", "quux"),
+                              ("new_name", "boing"))),
+        ), include_origin=True)
+       
     #enddef
 
     def test_emit_relay_events(self):
@@ -1146,22 +1190,35 @@ class Test(event.EventTestCase):
         ), includes_bearings=True)
 
         # Test relayed events for move.
-        events = []
+        foo_events = []
+        foo_dong_haa_events = []
+        bar_blah_events = []
         reset()
-        foo_dong_haa.add_relay_event_observer(lambda *args: events.append(args))
+        foo.add_relay_event_observer(lambda *args: foo_events.append(args))
+        foo_dong_haa.add_relay_event_observer(lambda *args: foo_dong_haa_events.append(args))
+        bar_blah.add_relay_event_observer(lambda *args: bar_blah_events.append(args))
         ctx.move("foo::dong", "bar::argh")
         self.wait_for_events()
-        self.assertEventsMatch(events, (
-            ((BRG_CHILDREN, RemoveChildEvent), (("parent", foo),
-                                                ("childname", "dong"))),
-            ((BRG_CHILDREN, RenameEvent), (("qname", foo_dong),
-                                           ("old_name", "dong"),
-                                           ("new_name", "argh"))),
-            ((BRG_CHILDREN, AddChildEvent), (("parent", bar),
-                                             ("childname", "argh"))),
-            ((BRG_CHILDREN, ChangeParentEvent), (("qname", foo_dong),
-                                                 ("old_parent", foo),
-                                                 ("new_parent", bar))),
+        self.assertEventsMatch(foo_events, (
+            ((event.BRG_ORIGIN, ChildMoveEvent), (("qname", foo_dong),
+                                            ("old_parent", foo),
+                                            ("new_parent", bar),
+                                            ("old_name", "dong"),
+                                            ("new_name", "argh"))),
+        ), includes_bearings=True)
+        self.assertEventsMatch(foo_dong_haa_events, (
+            ((BRG_CHILDREN, ChildMoveEvent), (("qname", foo_dong),
+                                              ("old_parent", foo),
+                                              ("new_parent", bar),
+                                              ("old_name", "dong"),
+                                              ("new_name", "argh"))),
+        ), includes_bearings=True)
+        self.assertEventsMatch(bar_blah_events, (
+            ((BRG_CHILDREN, ChildMoveEvent), (("qname", foo_dong),
+                                              ("old_parent", foo),
+                                              ("new_parent", bar),
+                                              ("old_name", "dong"),
+                                              ("new_name", "argh"))),
         ), includes_bearings=True)
        
     #enddef

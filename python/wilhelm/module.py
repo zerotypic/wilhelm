@@ -128,7 +128,8 @@ class Module(object):
         
         DBG("Got rename event: %r", ev)
         DBG("\t%r -> %r", ev.oldname, ev.newname)
-
+        DBG("\tName set at addr 0x%08x: %r", ev.addr, idaapi.get_name(ev.addr))
+        
         old_qn = self._get_qname_for_ida_name(ev.oldname)
 
         DBG("old_qn = %r", old_qn)
@@ -149,6 +150,18 @@ class Module(object):
             #raise ExistingNameExn("Name {} already exists.".format(new_qns))
         #endif
 
+        # If the object being renamed is a function, check to see if the
+        # new name is local to the function, and if so, refuse to rename.
+        if idaapi.is_func(idaapi.get_flags(ev.addr)):
+            if idaapi.is_name_defined_locally(idaapi.get_func(ev.addr),
+                                              ev.newname,
+                                              idaapi.ignore_none):
+                raise ida_events.RenameEvent.CannotRenameExn(
+                    "Name {} is local to function.".format(new_qns)
+                )
+            #endif
+        #endif
+        
         # Perform the actual move.
         DBG("Moving qname from %r to %r.", old_qn.fullname, new_qns)
         self.value_context.move(old_qn.fullname, new_qns)
@@ -158,7 +171,6 @@ class Module(object):
     #enddef
 
     def __post_handle_orphan_qname(self, ev):
-        # XXX: Note that this function just removes the name, but doesn't 
         with ida_events.suppress_events():
             addr = ev.qname.entity.addr
             DBG("Deleting name at address 0x%08x", addr)
@@ -167,6 +179,7 @@ class Module(object):
             auto_name = idaapi.get_name(addr)
         #endwith
         qname = self._get_qname_for_ida_name(auto_name, build=True)
+        # XXX: Incomplete, finish this!
         # qname.entity = Item.build_item_from_addr(addr)
     #enddef
     

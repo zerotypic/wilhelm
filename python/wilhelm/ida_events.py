@@ -12,10 +12,9 @@ from .util import asyncutils
 
 (LOG, DCRIT, DERROR, DWARN, DINFO, DBG) = util.setup_logger(__name__)
 
-# XXX: Change to using this as the base event class
-#class IDAEvent(event.Event): pass
+class IDAEvent(event.Event): pass
 
-class RenameEvent(event.Event):
+class RenameEvent(IDAEvent):
     class CannotRenameExn(event.EventHandlerExn):
         def __init__(self, reason): self.reason = reason
     #endclass
@@ -58,14 +57,16 @@ class IDPHooks(idaapi.IDP_Hooks):
         ev = RenameEvent(ea, idaapi.get_name(ea), new_name)
         event.manager.trigger(ev)
         DBG("ev_rename: Waiting for event to complete...")
-        asyncutils.run_task_till_done(ev.wait_till_handled())
+        asyncutils.run_task_till_done(ev.wait_till_completed())
         if ev.has_exceptions():
             DBG("ev:rename: handlers raised exceptions.")
             for (_, exn) in ev.get_exceptions():
                 if isinstance(exn, RenameEvent.CannotRenameExn):
-                    # XXX: Pop up a dialog box to explain why renaming
-                    # failed.
-                    DBG("Could not rename: {}".format(exn.reason))
+                    # XXX: This message appears twice, figure out
+                    # why. ev_rename is probably called twice, perhaps to
+                    # auto-retry when it fails the first time.
+                    DWARN("Could not rename: {}".format(exn.reason))
+                    idaapi.warning("Could not rename: {}".format(exn.reason))
                     return -1
                 else:
                     raise exn
@@ -84,8 +85,10 @@ class IDBHooks(idaapi.IDB_Hooks):
         super().__init__()
         self._suppress_events = False
     #enddef
-    
+
+    @suppressable
     def renamed(self, ea, new_name, local_name):
+        DBG("renamed: addr 0x%08x has been renamed to: %r", ea, new_name)
         pass
     #enddef
 

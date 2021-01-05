@@ -11,6 +11,9 @@ from . import setup_logger
 
 (LOG, DCRIT, DERROR, DWARN, DINFO, DBG) = setup_logger(__name__)
 
+def spawn_task(coro): return asyncio.get_event_loop().create_task(coro)
+
+# XXX: DEBUGGING STUFF
 __counter = 0
 
 def run_task_till_done(coro):
@@ -31,6 +34,7 @@ def run_task_till_done(coro):
         time.sleep(0.01)
     #endwhile
     DBG("task #%d, task completed: %r", mycounter, t)
-    return t
+    # Note: This will raise the exception that terminated the task, if any.
+    return t.result()
     
 #enddef

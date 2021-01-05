@@ -7,6 +7,8 @@ import logging
 import enum
 import operator
 
+from inspect import isawaitable
+
 from . import util
 from .util import TYPECHECK
 from .util import asyncutils
@@ -14,12 +16,17 @@ from .util import asyncutils
 class Exn(Exception): pass
 class UnknownHandlerExn(Exn): pass
 class InvalidHandlerExn(Exn): pass
-class LoopStartedExn(Exn): pass
-class LoopNotStartedExn(Exn): pass
 class InvalidObserverExn(Exn): pass
 class UnknownObserverExn(Exn): pass
 class InvalidBearingExn(Exn): pass
 class InvalidRelayExn(Exn): pass
+
+class LoopExn(Exn): pass
+class LoopStartedExn(LoopExn): pass
+class LoopNotStartedExn(LoopExn): pass
+class EventTaskCancelledExn(LoopExn): pass
+class EventTaskExceptionExn(LoopExn): pass
+class CleanupCompletedEventExn(LoopExn): pass
 
 (LOG, DCRIT, DERROR, DWARN, DINFO, DBG) = util.setup_logger(__name__)
 
@@ -41,9 +48,13 @@ class Event(object):
 
     def __init__(self, origin=None, tag=None):
         if origin != None: TYPECHECK(origin, Emitter)
-        self.__handled = asyncio.Event()
         self.__origin = origin
         self.__tag = None if tag == None else str(tag)
+
+        self.__handled = asyncio.Event()
+        self.__observed = asyncio.Event()
+        self.__handler_task = None
+        self.__observer_task = None
         self.__exns = None
     #enddef
 
@@ -54,15 +65,33 @@ class Event(object):
     def origin(self): return self.__origin
     
     def is_handled(self): return self.__handled.is_set()
+    def is_observed(self): return self.__observed.is_set()
+    def is_completed(self): return self.is_handled() and self.is_observed()
 
     def mark_handled(self, exns=None):
-        if exns == []: exns = None
-        self.__exns = exns
+        if exns != None and exns != []:
+            if self.__exns == None: self.__exns = []
+            self.__exns += exns
+        #endif
+        DBG("Marking event %r as handled.", self)
         self.__handled.set()
     #enddef
 
-    def clear_handled(self): self.__handled.clear()
+    def mark_observed(self, exns=None):
+        if exns != None and exns != []:
+            if self.__exns == None: self.__exns = []
+            self.__exns += exns
+        #endif
+        self.__observed.set()
+    #enddef
 
+    def clear_handled(self): self.__handled.clear()
+    def clear_observed(self): self.__observed.clear()
+    def clear_all(self):
+        self.clear_handled()
+        self.clear_observed()
+    #enddef
+    
     def has_exceptions(self): return self.__exns != None
     
     def get_exceptions(self):
@@ -73,8 +102,21 @@ class Event(object):
         return list(self.__exns) if self.__exns != None else []
     #enddef
     
-    async def wait_till_handled(self): await self.__handled.wait()
+    async def wait_till_completed(self):
+        await asyncio.gather(self.__handled.wait(),
+                             self.__observed.wait())
+    #enddef
 
+    @property
+    def _handler_task(self): return self.__handler_task
+    @_handler_task.setter
+    def _handler_task(self, hnd): self.__handler_task = hnd
+
+    @property
+    def _observer_task(self): return self.__observer_task
+    @_observer_task.setter
+    def _observer_task(self, hnd): self.__observer_task = hnd
+    
 #endclass
 
 class Emitter(object):
@@ -115,19 +157,21 @@ class Emitter(object):
         manager.trigger(ev)
         return ev
     #enddef
-
-    # Wait for event to be handled before continuing.
-    def emit_event_and_wait(self, evtype, *args, **kwargs):
-        ev = self.emit_event(evtype, *args, **kwargs)
-        asyncutils.run_task_till_done(ev.wait_till_handled())
+    
+    async def emit_event_async(self, evtype, *args, **kwargs):
+        ev = evtype(*args, origin=self, **kwargs)
+        await manager.trigger_async(ev)
         return ev
     #enddef
-    
-    def _notify_observers(self, ev):
-        for obs in self.__event_observers:
-            obs(ev)
-        #endfor
+   
+    # Wait for event to be handled before continuing.
+    async def emit_event_and_wait(self, evtype, *args, **kwargs):
+        ev = await self.emit_event_async(evtype, *args, **kwargs)
+        await ev.wait_till_completed()
+        return ev
     #enddef
+
+    def _gather_observers(self): return self.__event_observers
     
 #endclass
 
@@ -212,19 +256,13 @@ class Relay(Emitter, metaclass=RelayMeta):
         self.clear_event_observers()
         self.clear_relay_event_observers()
     #enddef
-    
-    def _notify_relay_observers(self, bearing, ev):
-        DBG("%r is notifying relay observers: %r", self, self.__relay_event_observers)
-        if bearing != BRG_ORIGIN: TYPECHECK(self, bearing.Relay)
-        for obs in self.__relay_event_observers:
-            result = obs(bearing, ev)
-            if result == RELAY.STOP: raise _RelayStopExn()
-        #endfor
-    #enddef
 
-    def _relay_event(self, bearing, ev):
-
-        if bearing == BRG_ORIGIN: return
+    # acc is accumulator of all observers
+    def _gather_relay_observers(self, bearing, acc):
+        if bearing == BRG_ORIGIN:
+            acc += self.__relay_event_observers
+            return
+        #endif
 
         info = self.__class__._event_relay_info
 
@@ -233,7 +271,6 @@ class Relay(Emitter, metaclass=RelayMeta):
                 "Relay {!r} is not on bearing {!r}".format(
                     self, bearing))
         #endif
-        
         if not bearing in info:
             raise InvalidRelayExn(
                 "Relay {!r} does not have an adjacents property for bearing {!r}".format(
@@ -247,15 +284,13 @@ class Relay(Emitter, metaclass=RelayMeta):
         elif adjacents == None:
             adjacents = []
         #endif
-        DBG("Relaying event %r on bearing %r to adjacents: %r",
-            ev, bearing, list(adjacents))
         for r in adjacents:
-            r._notify_relay_observers(bearing, ev)
-            r._relay_event(bearing, ev)
+            acc += r.__relay_event_observers
+            r._gather_relay_observers(bearing, acc)
         #endfor
 
     #enddef
-
+    
     @classmethod
     def _event_bearings(cls):
         return list(cls._event_relay_info.keys())
@@ -292,6 +327,7 @@ class EventManager(object):
 
     def __init__(self):
         self._q = asyncio.Queue()    # Event queue
+        self._pending_events = set() # Pending events
         self.reset_handlers()
         self._loop_task = None
         self._last_exn_event = None
@@ -359,9 +395,11 @@ class EventManager(object):
         return _register
     #enddef
 
-    # Default event handler. This handler takes care of notifying
-    # observers of the event's origin.
+    # Default event handler. This is used as a placeholder and never
+    # actually executes.
     def _default_handler(self, ev):
+        return
+    
         # Notify observers of event's origin
         origin = ev.origin
         if isinstance(origin, Emitter):
@@ -392,139 +430,466 @@ class EventManager(object):
     
     async def trigger_async(self, ev):
         '''
-        Triggers an event. Returns an asyncio.Event that is set when this
-        event has been handled.
+        Triggers an event.
         '''
         TYPECHECK(ev, Event)
-        DBG("Triggering event: %r", ev)
         await self._q.put(ev)
-        DBG("Done triggering event: %r", ev)
         return ev
     #enddef
 
+    async def trigger_and_wait(self, ev):
+        ev = await self.trigger_async(ev)
+        await ev.wait_till_completed()
+        return ev
+    #enddef
+    
     def trigger(self, ev):
+        '''Triggers an event synchronously without blocking.
+        This functions immediately puts a new Event into the event
+        queue. If the queue is full, it will raise
+        asyncio.QueueFull. Currently, the queue is defined to have an
+        infinite size, so the exception should never be raised.
+        '''
         DBG("Called event.manager.trigger on event %r", ev)
-        t = asyncutils.run_task_till_done(self.trigger_async(ev))
-        return t.result()
-    #enddef
-
-    def trigger_and_wait(self, ev):
-        ev = self.trigger(ev)
-        asyncutils.run_task_till_done(ev.wait_till_handled())
+        TYPECHECK(ev, Event)
+        self._q.put_nowait(ev)
         return ev
-    #enddef    
+    #enddef
 
     async def wait_till_queue_empty(self):
         '''Waits till the event queue is empty.'''
         await self._q.join()
     #enddef
     
-    def last_exn_event(self): return self._last_exn_event
+    def last_exn_event(self):
+        '''Returns the last event whose handlers/observers raised exceptions.'''
+        return self._last_exn_event
+    #enddef
+
+    # Runs a function. If it returns an awaitable (i.e. it was probably a
+    # coroutine function), await on the awaitable.
+    async def _run_or_await(self, f, *args, **kwargs):
+        DBG("Running function %r", f)
+        r = f(*args, **kwargs)
+        DBG("\tfunction returned: %r", r)
+        if isawaitable(r): r = await r
+        return r
+    #enddef
     
-    async def _event_loop(self):
-        while True:
-            DBG("Waiting for event queue")
-            ev = await self._q.get()
-            evtype = type(ev)
-            DBG("Handling event %r", ev)
+    async def _run_handlers_task(self, ev, handlers):
+        '''Run handlers for event. (internal helper function)
+
+        Coroutine, that given a priority-handler list, calls the handlers
+        for the event <ev>. If the handlers are coroutines, await them.
+        Meant to be run as a task.
+
+        :param ev: event whose handlers is being called
+        :param handlers: A list of (priority, handler) tuples.
+        :returns: a possibly empty list of exceptions raised by the handlers.
+        '''
+
+        DBG("_run_handlers_task, ev = %r, handlers = %r", ev, handlers)
+        
+        # Sort based on priority
+        handlers.sort(key=operator.itemgetter(0))
             
-            handlers = []
-            while True:
-
-                # Because we have a default handler for the Event base class,
-                # this loop will always be able to find a handler.           
-                while not evtype in self._handler_map:
-                    evtype = evtype.__bases__[0]
-                #endwhile
-
-                evmap = self._handler_map[evtype]
-
-                # Default handlers for this type
-                if None in evmap: handlers += evmap[None]
-                
-                # Tag-specific handlers for this type
-                if ev.tag != None and ev.tag in evmap:
-                    handlers += evmap[ev.tag]
+        # Call all associated handlers.
+        exns = []
+        post_handlers = []
+        DBG("Calling event handlers.")
+        for (p, h) in handlers:
+            try:
+                await self._run_or_await(h, ev)
+            except _PrivilegedHandlerPostActionExn as exn:
+                if p < PRIORITY_MIN:
+                    post_handlers.append(exn.post_handler)
+                else:
+                    DWARN("Non-privileged handler tried to set a post-handler, ignoring.")
                 #endif
+            except Exception as exn:
+                exns.append((h, exn))
+            #endtry
+        #endfor
+        DBG("Finished calling all event handlers.")
 
-                # Break out of the loop when we hit the base event.
-                if evtype == Event: break
-
-                # Go up one supertype and find handlers for that.
-                evtype = evtype.__bases__[0]
-                
-            #endwhile
-
-            # Sort based on priority
-            handlers.sort(key=operator.itemgetter(0))
-            
-            # Call all associated handlers.
-            exns = []
-            post_handlers = []
-            DBG("Calling event handlers.")
-            for (p, f) in handlers:
+        if len(post_handlers) > 0:
+            DBG("Post handlers have been registered, calling them now.")
+            for ph in post_handlers:
                 try:
-                    f(ev)
-                except _PrivilegedHandlerPostActionExn as exn:
-                    if p < PRIORITY_MIN:
-                        post_handlers.append(exn.post_handler)
-                    else:
-                        WARNING("Non-privileged handler tried to set a post-handler, ignoring.")
-                    #endif
+                    await self._run_or_await(ph, ev)
                 except Exception as exn:
-                    exns.append((f, exn))
+                    exns.append((ph, exn))
                 #endtry
             #endfor
-            DBG("Finished calling all event handlers.")
+            DBG("Finished calling post handlers.")
+        #endif
 
-            if len(post_handlers) > 0:
-                DBG("Post handlers have been registered, calling them now.")
-                for ph in post_handlers:
-                    try:
-                        ph(ev)
-                    except Exception as exn:
-                        exns.append((ph, exn))
-                    #endtry
-                #endfor
-                DBG("Finished calling post handlers.")
-            #endif
-                    
-            if len(exns) == 0: exns = None
+        # XXX: THE BELOW CODE RAISES AN EXCEPTION, WRITE A WRAPPER TO
+        # CATCH IT
+        if LOG.isEnabledFor(logging.INFO) and exns != []:
+            DINFO("Observers raised exceptions for event %r:", ev)
+            for exn in exns: DINFO("\t%r", exn)
+        #endif
+        
+        # Mark exception as handled.
+        ev.mark_handled(exns=exns)
+               
+    #enddef
+
+    def _process_handlers(self, ev):
+        '''Process event handlers for event. (internal helper function)
+
+        Gathers the list of event handlers registered for an event. If
+        there are any, run them by creating a task that runs the coroutine
+        _run_handlers_task().
+
+        :param event: the event whose handlers are to be processed
+        :returns: the task that was created to run the handlers, or None if
+        no task was created.
+        '''
+        DBG("Processing handlers for event %r", ev)
+        # First, gather all handlers.
+        handlers = []
+        evtype = type(ev)
+        while True:
+
+            # Because we have a default handler for the Event base class,
+            # this loop will always be able to find a handler.           
+            while not evtype in self._handler_map:
+                evtype = evtype.__bases__[0]
+            #endwhile
+
+            evmap = self._handler_map[evtype]
+
+            # General handlers for this type
+            if None in evmap: handlers += evmap[None]
                 
-            # Mark that this event has been handled.
-            ev.mark_handled(exns=exns)
-            
-            if exns != None:
-                # This event has exceptions, store in _last_exn_event for
-                # diagnostic purposes.
-                if LOG.isEnabledFor(logging.DEBUG):
-                    DBG("Event raised exceptions, recording.")
-                    DBG("Exceptions:")
-                    for exn in exns: DBG("\t %r", exn)
-                #endif
-                self._last_exn_event = ev
+            # Tag-specific handlers for this type
+            if ev.tag != None and ev.tag in evmap:
+                handlers += evmap[ev.tag]
             #endif
+
+            # Break out of the loop when we hit the base event.
+            if evtype == Event: break
+
+            # Go up one supertype and find handlers for that.
+            evtype = evtype.__bases__[0]
+                
+        #endwhile
+        DBG("\thandlers = %r", handlers)
+        if len(handlers) == 1 and handlers[0][1] == self._default_handler:
+            # Only default handler was set, don't bother running it,
+            # just mark as handled.
+            DBG("\tOnly default handler, marked handled and continue.")
+            ev.mark_handled()
+            return None
+        else:
+            DBG("\tHandlers exist, create a task.")
+            # Start a task to run the handlers.
+            task = asyncio.get_event_loop().create_task(
+                self._run_handlers_task(ev, handlers)
+            )
+            ev._handler_task = task
+            return task
+        #endif
+        
+    #enddef
+
+    async def _run_observers_task(self, ev, emit_obvs, relay_obvs):
+        '''Run observers for an event. (internal helper function)
+ 
+        Coroutine that, given lists of emit-observers and relay-observers,
+        calls the observers. If the observers are coroutines, await
+        them.
+        Meant to be run as a task.
+
+        :param emit_obvs: List of emit-observers
+        :param relay_obvs: List of (bearing, obvs) tuples, where bearing
+        is a relay bearing and obvs is a list of relay-observers for that
+        bearing.
+        '''
+        exns = []
+        
+        # First process emit observers.
+        DBG("Calling emit observers.")
+        for obv in emit_obvs:
+            try:
+                await self._run_or_await(obv, ev)
+            except Exception as exn:
+                exns.append((obv, exn))
+            #endtry
+        #endfor
+        DBG("Finished calling emit observers.")
+
+        # Now process relay observers.
+        for (brg, obvs) in relay_obvs:
+            DBG("Relaying to observers along %r", brg)
+            for obv in obvs:
+                try:
+                    r = await self._run_or_await(obv, brg, ev)
+                except Exception as exn:
+                    exns.append((obv, exn))
+                #endtry
+                if r == RELAY.STOP:
+                    DBG("Relay observer %r along bearing %r requested to stop relaying event %r",
+                        obv, brg, ev)
+                    break
+                #endif
+            #endfor
+        #endfor
+        DBG("Finished calling all relay observers.")
+
+        if LOG.isEnabledFor(logging.INFO) and exns != []:
+            INFO("Observers raised exceptions for event %r:", ev)
+            for exn in exns: INFO("\t%r", exn)
+        #endif
+        
+        ev.mark_observed(exns=exns)
+        
+    #enddef
+    
+    def _process_observers(self, ev):
+        '''Process observers for an event.
+
+        Given an event, gather both emit-observers and relay-observers of
+        the event. If there are any, run them by starting a task that runs
+        the coroutine _run_observers_task().
+
+        :param ev: event whose observers are to be processed
+        :returns: the task that was created to run the observers, or None if
+        no task was created.
+        '''
+        origin = ev.origin
+        # Gather emit-observers.
+        emit_obvs = origin._gather_observers() if isinstance(origin, Emitter) else []
+
+        # Gather relay-observers
+        has_relay_observers = False
+        relay_obvs = []
+        if isinstance(origin, Relay):
+            for brg in (BRG_ORIGIN, *origin._event_bearings()):
+                obvs = []
+                origin._gather_relay_observers(brg, obvs)
+                if obvs != []: has_relay_observers = True
+                relay_obvs.append((brg, obvs))
+            #endfor
+        #endif
+
+        DBG("For event %r, emit_obvs = %r, relay_obvs = %r",
+            ev, emit_obvs, relay_obvs)
+        
+        if emit_obvs == [] and has_relay_observers == False:
+            # No observers found. Mark as observed and return.
+            ev.mark_observed()
+            return None
+        else:
+            # Start a task to run the observers.
+            task = asyncio.get_event_loop().create_task(
+                self._run_observers_task(ev, emit_obvs, relay_obvs)
+            )
+            ev._observer_task = task
+            return task
+        #endif
+        
+    #enddef
+
+    def _cleanup_event(self, ev, handler_exn = None, observer_exn = None):
+        '''Marks event as completed, and set exceptions. (internal helper function)'''
+        DBG("Cleaning up event %r", ev)
+        if ev.is_completed():
+            raise CleanupCompletedEventExn("Cannot clean up completed event {!r}".format(ev))
+        #endif
+        if handler_exn != None: handler_exn = [(None, handler_exn)]
+        if observer_exn != None: observer_exn = [(None, observer_exn)]
+        if not ev.is_handled(): ev.mark_handled(exns=handler_exn)
+        if not ev.is_observed(): ev.mark_observed(exns=observer_exn)
+        # XXX: Cancel any currently running tasks?
+    #enddef
+
+    def _process_pending_events(self):
+        '''Housekeeping on pending event list. (internal helper function)'''
+        # XXX: Introduce some system of keeping track of stale events, and
+        # forcefully cleaning them out.
+        DBG("_process_pending_events: %r", self._pending_events)
+        
+        for ev in tuple(self._pending_events):
+            DBG("\tev: %r", ev)
+            if ev.is_completed():
+                DBG("\tEvent %r has completed.", ev)
+                if ev.has_exceptions():
+                    DBG("\tEvent %r raised exceptions, recording.", ev)
+                    self._last_exn_event = ev
+                #endif
+                self._pending_events.remove(ev)
+                DBG("\tInform queue we're done with this event.")
+                self._q.task_done()
+            else:
+                # XXX: Need to clean up logic here a bit, to test for the
+                # different possible states more cleanly. Or, should
+                # introduce some explicit event states with semantics
+                # governing state transitions so we can reason about the
+                # behaviour better.
+                DBG("\tEvent %r not yet completed.", ev)
+                handler_task = ev._handler_task
+                observer_task = ev._observer_task
+                DBG("\thandler_task = %r, observer_task = %r", handler_task, observer_task)
+                if not handler_task.done() and \
+                   (observer_task == None or not observer_task.done()): continue
+               
+                if handler_task.done() and handler_task.cancelled():
+                    self._cleanup_event(ev, handler_exn=EventTaskCancelledExn(
+                        "Event {!r}: handler task was cancelled.".format(ev)))
+                elif handler_task.done() and handler_task.exception() != None:
+                    self._cleanup_event(ev, handler_exn=EventTaskExceptionExn(
+                        "Event {!r}: handler task raised exception {!r}".format(
+                            ev, handler_task.exception()),
+                        handler_task.exception()
+                    ))
+                elif observer_task == None:
+                    # We're probably in the transient state where
+                    # handler_task is done, but the observer_task hasn't
+                    # been setup yet. Just ignore and continue.
+                    continue
+                elif observer_task.done() and observer_task.cancelled():
+                    self._cleanup_event(ev, observer_exn=EventTaskCancelledExn(
+                        "Event {!r}: observer task was cancelled.".format(ev)))
+                elif observer_task.done() and observer_task.exception() != None:
+                    self._cleanup_event(ev, observer_exn=EventTaskExceptionExn(
+                        "Event {!r}: observer task raised exception {!r}".format(
+                            ev, observer_task.exception()),
+                        handler_task.exception()
+                    ))
+                #endif
+            #endif
+        #endfor
+
+        DBG("Leaving _process_pending_events")
+        
+    #enddef
+    
+    async def _event_loop(self):
+        
+        # Helper function for running event processor functions defined
+        # above. Runs a processor, and if it returns a task, register the
+        # continuation <cont> to run after the task completes. Otherwise,
+        # run <cont> immediately.
+        # XXX: Currently not used. We should profile to find out whether
+        # there's a performance difference between using the _stageN
+        # functions below, and using this.
+        def _process_and_continue(processor, args, cont):
+            task = processor(*args)
+            if task == None:
+                return cont()
+            else:
+                task.add_done_callback(cont)
+                return task
+            #endif
+        #enddef
+        
+        def _stage1(ev):
+            DBG("Stage 1: %r", ev)
+            try:
+                handler_task = self._process_handlers(ev)
+            except Exception as exn:
+                DBG("\tHandler task resulted in exception, storing in event.")
+                self._cleanup_event(ev, handler_exn=exn)
+                # XXX: Should we call to _stage3 here to clean up?
+                return
+            #endtry
+            if handler_task != None:
+                DBG("\tHandler task created, adding done callback")
+                handler_task.add_done_callback(lambda _: _stage2(ev))
+            else:
+                DBG("\tNo task needed.")
+                _stage2(ev)
+            #endif
+        #enddef
+        def _stage2(ev):
+            DBG("Stage 2: %r", ev)
+            try:
+                observer_task = self._process_observers(ev)
+            except Exception as exn:
+                DBG("\tObserver task resulted in exception, storing in event.")
+                self._cleanup_event(ev, observer_exn=exn)
+                # We're either running as part of the event loop task, or
+                # as a done callback of the stage1 task. In either case,
+                # if we return from here, the event loop continues to run
+                # normally.
+                # XXX: Should we call into _stage3 here to clean up?
+                return
+            #endtry
+            if observer_task != None:
+                DBG("\tObserver task created, adding done callback")
+                observer_task.add_done_callback(lambda _: _stage3(ev))
+            else:
+                DBG("\tNo task needed.")
+                _stage3(ev)
+            #endif
+        #enddef
+        def _stage3(ev):
+            DBG("Stage 3: %r", ev)
+            # XXX: What kind of exceptions should we catch here, if any?
+            self._process_pending_events()
+        #enddef
+        
+        while True:
+            DBG("Waiting for event queue")
+            try:
+                ev = await asyncio.wait_for(self._q.get(), 0.5)
+            except asyncio.TimeoutError:
+                # No event, just process pending events
+                DBG("No events, processing pending events.")
+                self._process_pending_events()
+                continue
+            #endtry
+                
+            DBG("Handling event %r", ev)
+            self._pending_events.add(ev)
             
-            # XXX: Document somewhere that any exceptions raised by event
-            # handlers end up stored in the event, and that if nothing
-            # processes them they'll just disappear.
-            # Maybe add some warning messages somewhere to note that
-            # exceptions were raised, or have some mechanism where events
-            # are explicitly closed, and if there are pending exceptions,
-            # raise them.
+            # First, process handlers. Register a callback for after
+            # handlers have been processed, to process observers, and
+            # register another callback for after observers have been
+            # processed, to process pending events.
+            # In the case where no tasks are created for each stage, run
+            # the next stage immediately.
+            # This code is a bit convoluted to avoid creating too many
+            # task objects for the most common scenario, which is no
+            # handlers and observers.
+
+            # _process_and_continue(
+            #     self._process_handlers, (ev,),
+            #     lambda: _process_and_continue(
+            #         self._process_observers, (ev,),
+            #         self._process_pending_events
+            #     )
+            # )           
             
-            # Tell queue that we're done with this event.
-            DBG("Inform queue that we're done with this event.")
-            self._q.task_done()
-            
+            # Begin the first stage.
+            # XXX: Do we need to catch any exceptions here?
+            _stage1(ev)
+
+            DBG("Completed stages.")
+
         #endwhile
     #enddef
 
     def is_loop_started(self): return self._loop_task != None and not self._loop_task.done()
     
     def start_loop(self):
+        def _loop_done_callback(future):
+            DBG("Event loop returned! %r", future)
+            exn = future.exception()
+            if exn != None:
+                DBG("Raising exception resulting in loop termination.")
+                import traceback
+                # XXX: Fix this traceback format, not printing correctly now.
+                for l in traceback.format_exception(None, exn, exn.__traceback__): DBG("\t" + l[:-1])
+                raise exn
+            #endif
+        #enddef
         if not self.is_loop_started():
             self._loop_task = asyncio.get_event_loop().create_task(self._event_loop())
+            self._loop_task.add_done_callback(_loop_done_callback)
         else:
             raise LoopStartedExn("Event loop already started.")
         #endif
@@ -571,7 +936,13 @@ import contextlib
 class EventTestCase(unittest.TestCase):
 
     def setUp(self):
-        if not manager.is_loop_started(): manager.start_loop()
+        def exn_handler(loop, context):
+            DWARN("Exception in asyncio loop %r!", loop)
+            DWARN("\tcontext = %r", context)
+        #enddef
+        asyncio.get_event_loop().set_exception_handler(exn_handler)
+
+        if not manager.is_loop_started(): manager.start_loop()        
     #enddef
 
     def tearDown(self):
@@ -590,8 +961,7 @@ class EventTestCase(unittest.TestCase):
     #enddef
 
     def run_coro(self, coro):
-        t = asyncutils.run_task_till_done(coro)
-        return t.result()
+        return asyncutils.run_task_till_done(coro)
     #enddef
 
     def wait_for_events(self, ignore_exceptions=False):
@@ -652,9 +1022,9 @@ class Test(EventTestCase):
         handler.clear_called()
         ev.clear_handled()
         await manager.trigger_async(ev)
-        await ev.wait_till_handled()
+        await ev.wait_till_completed()
         if len(ev.get_exceptions()) > 0:
-            raise ev.get_exceptions()[0]
+            raise ev.get_exceptions()[0][1]
         #endif
         if invert:
             self.assertFalse(handler.was_called())
@@ -714,7 +1084,7 @@ class Test(EventTestCase):
             bar_handler_b.clear_called()
             bar_event.clear_handled()
             await manager.trigger_async(bar_event)
-            await bar_event.wait_till_handled()
+            await bar_event.wait_till_completed()
             self.assertTrue(bar_handler_a.was_called())
             self.assertTrue(bar_handler_b.was_called())
         #enddef
@@ -770,7 +1140,7 @@ class Test(EventTestCase):
         async def _test_exns():
             ev = Test.FooEvent("foo")
             await manager.trigger_async(ev)
-            await ev.wait_till_handled()
+            await ev.wait_till_completed()
             return (ev, ev.get_exceptions())
         #enddef
         t = asyncutils.run_task_till_done(_test_exns())
@@ -815,7 +1185,7 @@ class Test(EventTestCase):
             bar_handler_tagged_b.clear_called()
             tagged_bar_event.clear_handled()
             await manager.trigger_async(tagged_bar_event)
-            await tagged_bar_event.wait_till_handled()
+            await tagged_bar_event.wait_till_completed()
             self.assertTrue(bar_handler_tagged_a.was_called())
             self.assertFalse(bar_handler_tagged_b.was_called())
         #enddef
@@ -1088,23 +1458,42 @@ class Test(EventTestCase):
        
         bar._parent = secret_a
         manager.reset()
-        with self.safeAssertRaises(util.TypecheckExn):
+        with self.safeAssertRaises(InvalidBearingExn):
+            DBG("FOOFOO sending event")
             ev = bar.emit_event(Test.BarEvent, "test")
             self.wait_for_events()
+            DBG("FOOFOO completed wait")
         #endwith
 
-        manager.reset()
         class BadRelay(BRG_PARENT.Relay):
             def __init__(self):
                 super().__init__()
             #enddef
         #endclass
         bad = BadRelay()
+
+        manager.reset()
         with self.safeAssertRaises(TypeError):
             bad.emit_event(Test.FooEvent, "bad test")
             self.wait_for_events()
         #endwith
 
+        # Test with a handler registered.
+        manager.reset()
+        manager.register_handler(Test.FooEvent, lambda _: None)
+        with self.safeAssertRaises(TypeError):
+            bad.emit_event(Test.FooEvent, "bad test")
+            self.wait_for_events()
+        #endwith
+
+        # Test with an observer registered.
+        manager.reset()
+        bar.add_relay_event_observer(lambda _: None)
+        with self.safeAssertRaises(TypeError):
+            bad.emit_event(Test.FooEvent, "bad test")
+            self.wait_for_events()
+        #endwith
+        
         # XXX: Any more error conditions to test?
         
     #enddef    

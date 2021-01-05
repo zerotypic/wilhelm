@@ -564,7 +564,7 @@ class AsmStmt(Stmt): pass
 
 class Function(object):
     '''
-    A decompiled function. Roughly corresponds to HexRays' cfunc_c
+    A decompiled function. Roughly corresponds to HexRays' cfunc_t
     class. Functions an be created by providing an address within the
     function to be decompiled.
     '''

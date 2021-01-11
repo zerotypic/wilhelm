@@ -16,6 +16,11 @@ def spawn_task(coro): return asyncio.get_event_loop().create_task(coro)
 # XXX: DEBUGGING STUFF
 __counter = 0
 
+def process_events():
+    app = QApplication.instance()
+    app.processEvents()
+#enddef
+
 def run_task_till_done(coro):
     '''
     Runs a coroutine as a task, blocking till it is complete.

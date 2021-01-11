@@ -46,11 +46,18 @@ class _PrivilegedHandlerPostActionExn(EventHandlerExn):
 
 class Event(object):
 
-    def __init__(self, origin=None, tag=None):
+    def __init__(self, origin=None, tag=None, cause=None):
+        '''Base class for all events in wilhelm.
+        :param origin: The emitter of the event, if any
+        :param tag: A string that can be used to further sub-classify events
+        :param cause: The object that caused this event, optional.
+        '''
+
         if origin != None: TYPECHECK(origin, Emitter)
         self.__origin = origin
         self.__tag = None if tag == None else str(tag)
-
+        self.__cause = cause
+        
         self.__handled = asyncio.Event()
         self.__observed = asyncio.Event()
         self.__handler_task = None
@@ -60,9 +67,11 @@ class Event(object):
 
     @property
     def tag(self): return self.__tag
-
+   
     @property
     def origin(self): return self.__origin
+
+    def caused_by(self): return self.__cause
     
     def is_handled(self): return self.__handled.is_set()
     def is_observed(self): return self.__observed.is_set()
@@ -524,11 +533,9 @@ class EventManager(object):
             DBG("Finished calling post handlers.")
         #endif
 
-        # XXX: THE BELOW CODE RAISES AN EXCEPTION, WRITE A WRAPPER TO
-        # CATCH IT
-        if LOG.isEnabledFor(logging.INFO) and exns != []:
-            DINFO("Observers raised exceptions for event %r:", ev)
-            for exn in exns: DINFO("\t%r", exn)
+        if LOG.isEnabledFor(logging.WARNING) and exns != []:
+            DWARN("Handlers raised exceptions for event %r:", ev)
+            for exn in exns: DWARN("\t%r", exn)
         #endif
         
         # Mark exception as handled.
@@ -639,9 +646,9 @@ class EventManager(object):
         #endfor
         DBG("Finished calling all relay observers.")
 
-        if LOG.isEnabledFor(logging.INFO) and exns != []:
-            INFO("Observers raised exceptions for event %r:", ev)
-            for exn in exns: INFO("\t%r", exn)
+        if LOG.isEnabledFor(logging.WARNING) and exns != []:
+            DWARN("Observers raised exceptions for event %r:", ev)
+            for exn in exns: DWARN("\t%r", exn)
         #endif
         
         ev.mark_observed(exns=exns)
@@ -1143,10 +1150,8 @@ class Test(EventTestCase):
             await ev.wait_till_completed()
             return (ev, ev.get_exceptions())
         #enddef
-        t = asyncutils.run_task_till_done(_test_exns())
+        (ev, exns) = asyncutils.run_task_till_done(_test_exns())
 
-        (ev, exns) = t.result()
-        
         self.assertEqual(len(exns), 2)
 
         (h, exn) = exns[0]
@@ -1532,6 +1537,7 @@ class Test(EventTestCase):
     # XXX TODO: Tests for stopping relay events.
     # XXX TODO: Tests for *_and_wait() functions.
     # XXX TODO: Test for wait_till_queue_empty()
+    # XXX TODO: Tests for event.cause
 
     
 #endclass

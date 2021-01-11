@@ -4,6 +4,7 @@
 
 import itertools
 import re
+import asyncio
 
 from . import event
 from . import util
@@ -102,6 +103,14 @@ class ChildMoveEvent(QNameEvent):
     #enddef
 #endclass
 
+class EntityChangeEvent(QNameEvent):
+    '''Triggered whenever a qname's entity is set.'''
+    def __init__(self, ctx, qname, **kwargs):
+        super().__init__(ctx, **kwargs)
+        self.qname = qname
+    #enddef
+#endclass
+
 # Bearings for qnames
 BRG_PARENT = event.Bearing("qname.parent")
 BRG_CHILDREN = event.Bearing("qname.children")
@@ -163,42 +172,44 @@ class Root(BRG_PARENT.Relay, BRG_CHILDREN.Relay):
         del self._children[child._basename]
     #enddef
     
-    def add_child(self, child_basename):
+    def add_child(self, child_basename, caused_by=None):
         '''Creates and returns a new child to this namespace with basename 'child_basename'.'''
         self._check_duplicate_name(child_basename)
         new_child = QName(self._ctx, self, child_basename)
         self._add_child(new_child)
-        self.emit_event(AddChildEvent, self._ctx, self, child_basename)
+        self.emit_event(AddChildEvent, self._ctx, self, child_basename, cause=caused_by)
         return new_child           
     #enddef
 
-    async def remove_child_async(self, child_basename):
+    async def remove_child_async(self, child_basename, caused_by=None):
         '''Removes the child with basename 'child_basename' from this
         namespace. The child object becomes an orphaned QName and cannot
         be used.'''
         if child_basename in self._children:
             child = self._children[child_basename]
-            await self._orphan_child(child)
+            self._ctx._is_clean_event.clear()
+            await self._orphan_child(child, caused_by=caused_by)
+            self._ctx._is_clean_event.set()
         else:
             raise NotFoundExn("Cannot find child '{}' to delete.".format(child_basename))
         #endif        
     #enddef
 
-    def remove_child(self, child_basename):
-        return asyncutils.run_task_till_done(self.remove_child_async(child_basename))
+    def remove_child(self, child_basename, caused_by=None):
+        return asyncutils.run_task_till_done(self.remove_child_async(child_basename, caused_by=caused_by))
     #enddef
     
-    async def _orphan_child(self, child):
-
+    async def _orphan_child(self, child, caused_by=None):
+        DBG("Orphaning child: %r", child)
         # Begin orphaning from leaf nodes upwards.
         children = list(child.children.values())
-        for c in children: await child._orphan_child(c)
+        for c in children: await child._orphan_child(c, caused_by=caused_by)
 
         # Wait for event handlers to finish before we remove the child, so
         # they can access the child before it gets orphaned.
-        await self.emit_event_and_wait(RemoveChildEvent, self._ctx, self, child._basename)
-        await child.emit_event_and_wait(OrphanEvent, child._ctx, child)
-        
+        await self.emit_event_and_wait(RemoveChildEvent, self._ctx, self, child._basename, cause=caused_by)
+        await child.emit_event_and_wait(OrphanEvent, child._ctx, child, cause=caused_by)
+        DBG("\tEvent handlers completed, performing orphan operation.")
         child_basename = child._basename
         self._remove_child(child)
         child._old_fullname = child.fullname
@@ -211,7 +222,7 @@ class Root(BRG_PARENT.Relay, BRG_CHILDREN.Relay):
 
     # Adopts a child by removing it from its existing parent and adding it
     # as a child to this node. Optionally, renames the child before adding.
-    def _adopt_child(self, new_child, new_name=None):
+    def _adopt_child(self, new_child, new_name=None, caused_by=None):
         TYPECHECK(new_child, QName)
         if new_name == None:
             self._check_duplicate_name(new_child._basename)
@@ -237,20 +248,22 @@ class Root(BRG_PARENT.Relay, BRG_CHILDREN.Relay):
                               old_parent,
                               self,
                               old_name,
-                              new_name)
+                              new_name,
+                              cause=caused_by)
         self.emit_event(ChildMoveEvent,
                         self._ctx,
                         new_child,
                         old_parent,
                         self,
                         old_name,
-                        new_name)
+                        new_name,
+                        cause=caused_by)
 
         return new_child
 
     #enddef
 
-    def _rename_child(self, old_name, new_name):
+    def _rename_child(self, old_name, new_name, caused_by=None):
         self._check_duplicate_name(new_name)
         if not old_name in self._children:
             raise NotFoundExn("Cannot find child '{}' to rename.".format(old_name))
@@ -259,16 +272,18 @@ class Root(BRG_PARENT.Relay, BRG_CHILDREN.Relay):
         self._remove_child(child)
         child._basename = new_name
         self._add_child(child)
-        child.emit_event(RenameEvent, child._ctx, child, old_name, new_name)
+        child.emit_event(RenameEvent, child._ctx, child, old_name, new_name, cause=caused_by)
     #enddef
     
-    async def clear_async(self):
+    async def clear_async(self, caused_by=None):
         children = list(self._children.values())
-        for c in children: await self._orphan_child(c)
+        self._ctx._is_clean_event.clear()
+        for c in children: await self._orphan_child(c, caused_by=caused_by)
+        self._ctx._is_clean_event.set()
     #enddef
 
-    def clear(self):
-        asyncutils.run_task_till_done(self.clear_async())
+    def clear(self, caused_by=None):
+        asyncutils.run_task_till_done(self.clear_async(caused_by=caused_by))
     #enddef
     
     def search(self, query, **kwargs):
@@ -316,7 +331,7 @@ class QName(Root):
     def basename(self): return self._basename
 
     @basename.setter
-    def basename(self, value): self._parent._rename_child(self._basename, value)
+    def basename(self, value): self.set_basename(value)
     
     @property
     def suffix(self):
@@ -328,18 +343,12 @@ class QName(Root):
     def unsuffixed_basename(self):
         return self.basename.split(_SUFFIX_DELIMITER, 1)[0]
     #enddef
-    
+
     @BRG_PARENT.adjacents_property
     def parent(self): return self._parent
 
     @parent.setter
-    def parent(self, new_parent):
-        TYPECHECK(new_parent, Root)
-        if new_parent._ctx != self._ctx:
-            print("WARNING: Changing to a parent with a different context!")
-        #endif
-        new_parent._adopt_child(self)
-    #enddef
+    def parent(self, new_parent): self.set_parent(new_parent)
     
     @property
     def fullname(self): return self._parent._join(self.basename)
@@ -348,7 +357,7 @@ class QName(Root):
     def entity(self): return self._entity
 
     @entity.setter
-    def entity(self, value): self._entity = value   
+    def entity(self, value): self.set_entity(value)
 
     @property
     def is_terminal(self): return len(self._children) == 0
@@ -356,6 +365,23 @@ class QName(Root):
     @property
     def is_orphaned(self): return self._parent == None
 
+    def set_basename(self, new_basename, caused_by=None):
+        self._parent._rename_child(self._basename, new_basename, caused_by=caused_by)
+    #enddef
+    
+    def set_parent(self, new_parent, caused_by=None):
+        TYPECHECK(new_parent, Root)
+        if new_parent._ctx != self._ctx:
+            print("WARNING: Changing to a parent with a different context!")
+        #endif
+        new_parent._adopt_child(self, caused_by=caused_by)
+    #enddef  
+
+    def set_entity(self, entity, caused_by=None):
+        self._entity = entity
+        self.emit_event(EntityChangeEvent, self._ctx, self, cause=caused_by)
+    #enddef
+    
     _search_re = re.compile("^(::|:\*:)?(.*?)((::|:\*:).*)?$")
     def search(self, query, only_terminal=True):
         '''
@@ -436,6 +462,8 @@ class Context(object):
         '''Creates a new naming context. <name> is used to identify the context.'''
         self._name = name
         self._root = Root(self)
+        self._is_clean_event = asyncio.Event()
+        self._is_clean_event.set()
     #enddef
 
     def __repr__(self): return "Context<%s>" % self.name
@@ -446,6 +474,14 @@ class Context(object):
     @property
     def root(self): return self._root
 
+    async def wait_till_clean(self):
+        await self._is_clean_event.wait()
+    #enddef
+    
+    def terminals(self, filter_entity_type=None):
+        return self._root.terminals(filter_entity_type=filter_entity_type)
+    #enddef
+    
     def _locate(self, qns, build=False):
 
         namelist = qns_split(qns)
@@ -503,7 +539,7 @@ class Context(object):
         return self.root.search(query, **kwargs)
     #enddef    
 
-    def move(self, old_qns, new_qns):
+    def move(self, old_qns, new_qns, caused_by=None):
         '''
         Moves the qname identified by 'old_qname_str' to a new location on
         this context, identified by 'new_qname_str'.
@@ -525,9 +561,9 @@ class Context(object):
         
         if new_parent == qn.parent:
             # Locations have the same parent, can just do a rename.
-            qn.parent._rename_child(qn.basename, new_basename)
+            qn.parent._rename_child(qn.basename, new_basename, caused_by=caused_by)
         else:
-            new_parent._adopt_child(qn, new_name=new_basename)
+            new_parent._adopt_child(qn, new_name=new_basename, caused_by=caused_by)
         #endif
 
     #enddef
@@ -1222,5 +1258,8 @@ class Test(event.EventTestCase):
         ), includes_bearings=True)
        
     #enddef
+
+    # XXX: TODO: Add tests for setting caused_by values in emitted events.
+    # XXX: TODO: Add tests for is_clean event.
     
 #endclass

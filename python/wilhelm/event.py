@@ -309,6 +309,7 @@ class Relay(Emitter, metaclass=RelayMeta):
 
 class Bearing(object):
     def __init__(self, name):
+        self._name = name
         class _Relay(Relay):
             @self.adjacents_property
             def __missing_adjacents(self):
@@ -317,7 +318,6 @@ class Bearing(object):
         #endclass
         _Relay.__qualname__ = "{}_Relay".format(name)
         _Relay.__name__ = _Relay.__qualname__
-        self._name = name
         self.Relay = _Relay
     #enddef
     def __repr__(self): return "Bearing<{}>".format(self._name)
@@ -340,6 +340,7 @@ class EventManager(object):
         self.reset_handlers()
         self._loop_task = None
         self._last_exn_event = None
+        self._global_disable = False
     #enddef
 
     def reset(self):
@@ -356,6 +357,9 @@ class EventManager(object):
         self.register_handler(Event, self._default_handler, priority=99)
     #enddef
 
+    # When true, no events are actually processed.
+    def _set_global_disable(self, disable): self._global_disable = disable
+    
     # wilhelm-internal functions can call this to set negative (privileged) priorities
     def _register_handler(self, evtype, handler, tag=None, priority=0):
         if not callable(handler):
@@ -408,6 +412,8 @@ class EventManager(object):
     # actually executes.
     def _default_handler(self, ev):
         return
+        # XXX: REMOVE CODE BELOW, DOESN'T RUN
+
     
         # Notify observers of event's origin
         origin = ev.origin
@@ -441,6 +447,11 @@ class EventManager(object):
         '''
         Triggers an event.
         '''
+        if self._global_disable:
+            ev.mark_handled()
+            ev.mark_observed()
+            return ev
+        #endif
         TYPECHECK(ev, Event)
         await self._q.put(ev)
         return ev
@@ -460,6 +471,11 @@ class EventManager(object):
         infinite size, so the exception should never be raised.
         '''
         DBG("Called event.manager.trigger on event %r", ev)
+        if self._global_disable:
+            ev.mark_handled()
+            ev.mark_observed()
+            return ev
+        #endif
         TYPECHECK(ev, Event)
         self._q.put_nowait(ev)
         return ev

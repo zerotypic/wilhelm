@@ -81,7 +81,7 @@ class IDBHooks(idaapi.IDB_Hooks):
     def __init__(self, ctx):
         super().__init__()
         self._ctx = ctx
-        #enddef
+    #enddef
 
     @suppressable
     def renamed(self, ea, new_name, is_local):

@@ -80,6 +80,33 @@ class DataItem(Item):
     def data(self): return self._data
 #endclass    
 
+# XXX: Complete this!
+class ValueContext(qname.Context):
+
+    def __init__(self, mod, name="values"):
+        super().__init__(name)
+        self._parent_module = mod
+    #enddef
+
+    def get(self, qns, caused_by=None):
+        return self.locate(qns, caused_by=caused_by)
+    #enddef
+    
+    def add(self, qns, addr, caused_by=None):
+        qn = self.locate(qns, build=True, caused_by=caused_by)
+        if qn.entity == None:
+            qn.entity = Item.build_item_from_addr(addr)
+        else:
+            # XXX: Should raise an exception
+            pass
+        #endif
+        return qn
+    #enddef
+    
+#endclass
+
+
+
 # XXX: Currently, there can only be one module per IDA instance. This
 # class uses API calls that access that module's state,
 # e.g. idaapi.get_name(). If we add support for multiple modules, then the
@@ -121,14 +148,13 @@ class Module(object):
             
     def _get_qname_for_ida_name(self, ida_name, build=False):
         qns = self._get_qns_for_ida_name(ida_name)
-        return self.value_context.locate(qns, build=build)
+        return self.value_context.locate(qns, build=build, caused_by=self)
     #enddef
 
     def _create_qname_and_entity(self, ida_name, addr):
         DBG("_create_qname_and_entity: 0x%08x, %r", addr, ida_name)
         qn = self._get_qname_for_ida_name(ida_name, build=True)
         DBG("\tqn = %r", qn)
-        self._last_created_qname = qn
         # If the qname already exists, the entity might be set. Don't
         # overwrite it.
         if qn.entity == None:
@@ -139,7 +165,7 @@ class Module(object):
     
     def _populate_values(self):
         self.value_context.root.clear()
-        for (addr, ida_name) in util.get_all_names():           
+        for (addr, ida_name) in util.get_all_names():
             self._create_qname_and_entity(ida_name, addr)
         #endfor
     #enddef
@@ -296,8 +322,13 @@ def current(): return _CURRENT_MODULE
 def init_current_module():
     mod = Module()
     sys.modules[__name__]._CURRENT_MODULE = mod
+    DBG("Populating values....")
+    event.manager._set_global_disable(True)
     mod._populate_values()
+    event.manager._set_global_disable(False)
+    DBG("Done.")
     asyncutils.run_task_till_done(event.manager.wait_till_queue_empty())
+    DBG("Ready to register event handlers, registering...")
     event.manager._register_handler(ida_events.RenameEvent, mod._handle_ida_rename, priority=-99)
     event.manager._register_handler(
         qname.QNameEvent,
@@ -309,7 +340,7 @@ def init_current_module():
         mod._handle_type_events,
         tag=mod.type_context.name,
         priority=-99)
-    
+    DBG("Done.")
 #enddef
 
 

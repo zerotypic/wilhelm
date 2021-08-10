@@ -482,7 +482,7 @@ class Context(object):
         return self._root.terminals(filter_entity_type=filter_entity_type)
     #enddef
     
-    def _locate(self, qns, build=False):
+    def _locate(self, qns, build=False, caused_by=None):
 
         namelist = qns_split(qns)
         
@@ -491,7 +491,7 @@ class Context(object):
         for match_name in namelist:
             if not match_name in cur.children:
                 if build:
-                    cur = cur.add_child(match_name)
+                    cur = cur.add_child(match_name, caused_by=caused_by)
                 else:
                     #print("Could not find sub-name %s." % match_name)
                     return None
@@ -505,8 +505,8 @@ class Context(object):
         
     #enddef
 
-    def locate(self, qns, build=False):
-        qn = self._locate(qns, build=build)
+    def locate(self, qns, build=False, caused_by=None):
+        qn = self._locate(qns, build=build, caused_by=caused_by)
         if qn == None:
             raise NotFoundExn("Could not find name {}".format(qns))
         #endif
@@ -518,8 +518,8 @@ class Context(object):
         return qn != None
     #enddef
     
-    def build(self, qns):
-        return self._locate(qns, build=True)
+    def build(self, qns, caused_by=None):
+        return self._locate(qns, build=True, caused_by=caused_by)
     #enddef
     
     def search(self, query, **kwargs):

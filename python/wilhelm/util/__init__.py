@@ -57,7 +57,7 @@ def get_all_names():
     cur = 0
     while True:
         cur = idaapi.next_addr(cur)
-        if cur == idaapi.BADADDR: raise StopIteration
+        if cur == idaapi.BADADDR: return
         name = idaapi.get_name(cur)
         if name != "": yield (cur, name)
     #endwhile

@@ -16,6 +16,8 @@ from .util import lazylist
 from . import types
 from .types import WilType
 
+__all__ = []
+
 class Exn(Exception): pass
 class DecompilationExn(Exn): pass
 class ConversionExn(Exn): pass
@@ -417,6 +419,8 @@ class LocalVarExpr(VarExpr):
         super(LocalVarExpr, self).__init__(**kwargs)
         self._lvar = lvar
     #enddef
+    @property
+    def _name(self): return self.lvar.name
 #endclass
 
 class GlobalVarExpr(VarExpr):

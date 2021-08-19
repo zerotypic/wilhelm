@@ -3,6 +3,7 @@
 #
 
 import sys
+import asyncio
 
 import idaapi
 import idautils
@@ -14,23 +15,46 @@ from . import ast
 from . import util
 from .util import asyncutils
 
-__all__ = ("Module",)
-
 (LOG, DCRIT, DERROR, DWARN, DINFO, DBG) = util.setup_logger(__name__)
+
+__all__ = ("Module", "current")
+
+# Gets called on startup when module feature is enabled.
+async def _module_init(mod):
+    await mod.init_current_module()
+#enddef
 
 class Exn(Exception): pass
 class ExistingNameExn(Exn): pass
-class OverloadMapExn(Exn): pass
+class NotTerminalExn(Exn): pass
+class HasSuffixesExn(Exn): pass
 
 # An item is an object that can be found inside a module.
+# Items are designed to be lazy by default, holding only their address. To
+# access other values associated with an item, the item must be "called"
+# first: item().some_value
 class Item(object):
     def __init__(self, addr):
         self._addr = addr
+        self._is_lazy = True
     #enddef
 
     @property
     def addr(self): return self._addr
 
+    @property
+    def is_lazy(self): return self._is_lazy
+    
+    def realize(self): pass
+    
+    def __call__(self):
+        if self._is_lazy:
+            self.realize()
+            self._is_lazy = False
+        #endif
+        return self
+    #enddef
+    
     @classmethod
     def build_item_from_addr(cls, addr):
 
@@ -54,13 +78,13 @@ class FunctionItem(Item):
         self._func = None
     #enddef
 
-    def is_weak(self): return self._func == None
-    
+    def realize(self):
+        self._func = ast.Function(self.addr)
+    #enddef
+
     @property
     def func(self):
-        if self.is_weak():
-            self._func = ast.Function(self.addr)
-        #endif
+        if self._func == None: self()
         return self._func
     #enddef
     
@@ -80,7 +104,6 @@ class DataItem(Item):
     def data(self): return self._data
 #endclass    
 
-# XXX: Complete this!
 class ValueContext(qname.Context):
 
     def __init__(self, mod, name="values"):
@@ -88,11 +111,58 @@ class ValueContext(qname.Context):
         self._parent_module = mod
     #enddef
 
-    def get(self, qns, caused_by=None):
-        return self.locate(qns, caused_by=caused_by)
+    def get(self, qns):
+        '''Retrieves an item from the value context. QName should be that of a
+        terminal; otherwise an exception is raised.
+        '''
+
+        try:
+            qn = self.locate(qns)
+        except qname.NotFoundExn as e:
+            if qname.qns_suffix(qns) == None:
+                # Check to see if suffixes exist for this qname.
+                names = self.locate(qns, gather_suffixes=True)
+                if len(names) == 1:
+                    qn = names[0]
+                elif len(names) > 1:
+                    raise HasSuffixesExn("{} has multiple suffixes.".format(qns))
+                else:
+                    raise e
+                #endif
+            #endif
+        #endtry
+            
+        if qn.is_terminal:
+            return qn.entity
+        else:
+            raise NotTerminalExn("{} is not a terminal value.".format(qns))
+        #endif
+    #enddef
+
+    def get_suffixes(self, qns):
+        '''Retrieves all suffixes of the provided QName.
+
+        If the QName is that of an unsuffixed terminal, it is returned as
+        well. Any suffixes in the provided QName are ignored; only the
+        unsuffixed basename is used.
+        '''
+        return [(qn, qn.entity) for qn in self.locate(qns, gather_suffixes=True)]
     #enddef
     
+    def get_qname(self, qns):
+        '''Returns a QName object from the value context.'''
+        return self.locate(qns)
+    #enddef            
+    
     def add(self, qns, addr, caused_by=None):
+        '''Add a new item to the value context.
+
+        The item is constructed based on the provided address, and added to
+        the value context using the provided QName.
+
+        :qns: QName of the item, provided as a string.
+        :addr: Address of the item that is to be added.
+        '''
         qn = self.locate(qns, build=True, caused_by=caused_by)
         if qn.entity == None:
             qn.entity = Item.build_item_from_addr(addr)
@@ -102,20 +172,35 @@ class ValueContext(qname.Context):
         #endif
         return qn
     #enddef
+
+    def __getitem__(self, key):
+        try:
+            return self.get(key)
+        except (qname.NotFoundExn, NotTerminalExn):
+            raise KeyError(key)
+        #endtry
+    #enddef
+    def __iter__(self):
+        return (it.entity for it in super().__iter__())
+    #enddef
     
 #endclass
 
 
+class ModuleEvent(event.Event): pass
+class ModuleReadyEvent(ModuleEvent): pass
 
 # XXX: Currently, there can only be one module per IDA instance. This
 # class uses API calls that access that module's state,
 # e.g. idaapi.get_name(). If we add support for multiple modules, then the
 # code here needs to be rewritten.
-class Module(object):
+class Module(event.Emitter):
 
     def __init__(self):
-        self._value_ctx = qname.Context("value")
+        super().__init__()
+        self._value_ctx = ValueContext(self)
         self._type_ctx = qname.Context("type")
+        self._ready_event = asyncio.Event()
     #enddef
 
     def init_handlers(self):
@@ -124,12 +209,18 @@ class Module(object):
         self._type_ctx.root.clear_relay_event_observers()
         self._type_ctx.root.add_relay_event_observer(self._observe_type_events)
     #enddef
-    
+
     @property
     def value_context(self): return self._value_ctx
 
     @property
+    def values(self): return self._value_ctx
+    
+    @property
     def type_context(self): return self._type_ctx
+
+    @property
+    def types(self): return self._type_ctx
 
     def get_qname_for_addr(self, addr):
         return self._get_qname_for_ida_name(idaapi.get_name(addr))
@@ -163,13 +254,21 @@ class Module(object):
         return qn
     #enddef
     
-    def _populate_values(self):
-        self.value_context.root.clear()
+    async def _populate_values(self):
+        await self.value_context.root.clear_async()
         for (addr, ida_name) in util.get_all_names():
             self._create_qname_and_entity(ida_name, addr)
+            await asyncio.sleep(0)
         #endfor
     #enddef
 
+    async def _set_ready(self):
+        self._ready_event.set()
+        await self.emit_event_async(ModuleReadyEvent)
+    #enddef
+    def is_ready(self): return self._ready_event.is_set()
+    async def wait_until_ready(self): await self._ready_event.wait()
+    
     async def _handle_ida_rename(self, ev):
 
         DBG("Got rename event: %r", ev)
@@ -263,7 +362,7 @@ class Module(object):
             # before creating the new dummy name.
             DBG("\tWaiting for context to be clean before creating new qname.")
             async def _create_qname_with_dummy_name():
-                await self.value_context.wait_till_clean()
+                await self.value_context.wait_until_clean()
                 DBG("\tCreating new qname using dummy name.")
                 self._create_qname_and_entity(dummy_name, addr)
             #enddef
@@ -305,8 +404,13 @@ class Module(object):
         elif isinstance(ev, qname.OrphanEvent):
             # Register a post-handler
             raise event._PrivilegedHandlerPostActionExn(self.__post_handle_orphan_qname)
+
+        elif isinstance(ev, qname.AddChildEvent):
+            # XXX: Implement this?
+            pass
+            
         #endif
-       
+        
     #enddef
 
     def _handle_type_events(self, ev):
@@ -319,16 +423,16 @@ class Module(object):
 _CURRENT_MODULE = None
 def current(): return _CURRENT_MODULE
 
-def init_current_module():
+async def init_current_module():
     mod = Module()
     sys.modules[__name__]._CURRENT_MODULE = mod
-    DBG("Populating values....")
+    DINFO("Populating values....")
     event.manager._set_global_disable(True)
-    mod._populate_values()
+    await mod._populate_values()
     event.manager._set_global_disable(False)
-    DBG("Done.")
-    asyncutils.run_task_till_done(event.manager.wait_till_queue_empty())
-    DBG("Ready to register event handlers, registering...")
+    DINFO("Done.")
+    # await event.manager.wait_till_queue_empty()
+    DINFO("Ready to register event handlers, registering...")
     event.manager._register_handler(ida_events.RenameEvent, mod._handle_ida_rename, priority=-99)
     event.manager._register_handler(
         qname.QNameEvent,
@@ -340,7 +444,9 @@ def init_current_module():
         mod._handle_type_events,
         tag=mod.type_context.name,
         priority=-99)
-    DBG("Done.")
+    DINFO("Done.")
+    await mod._set_ready()
+    return mod
 #enddef
 
 

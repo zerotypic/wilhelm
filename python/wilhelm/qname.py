@@ -137,6 +137,11 @@ class Root(BRG_PARENT.Relay, BRG_CHILDREN.Relay):
 
     @BRG_CHILDREN.adjacents_property
     def children_list(self): return self.children.values()
+
+    def __len__(self): return len(self._children)
+    def __getitem__(self, key): return self._children[key]
+    def __iter__(self): return iter(self.children)
+    def __contains__(self, item): return item in self._children
     
     def descendents(self):
         '''Returns all descendents, including self.'''
@@ -474,39 +479,59 @@ class Context(object):
     @property
     def root(self): return self._root
 
-    async def wait_till_clean(self):
+    async def wait_until_clean(self):
         await self._is_clean_event.wait()
     #enddef
     
     def terminals(self, filter_entity_type=None):
         return self._root.terminals(filter_entity_type=filter_entity_type)
     #enddef
-    
-    def _locate(self, qns, build=False, caused_by=None):
 
-        namelist = qns_split(qns)
+    # Internal function used to implement locate and build.
+    # Notes:
+    # - when gather_suffixes is True, look for all qnames that have the
+    #   queried unsuffixed basename.
+    def _locate(self, qns, build=False, gather_suffixes=False, caused_by=None):
         
+        # Note: This list is guaranteed to contain at least 1 element.
+        namelist = qns_split(qns)
+
         cur = self.root
-        found = False
-        for match_name in namelist:
+        # Find our way to the direct parent of the node being located.
+        for match_name in namelist[:-1]:
             if not match_name in cur.children:
                 if build:
                     cur = cur.add_child(match_name, caused_by=caused_by)
                 else:
-                    #print("Could not find sub-name %s." % match_name)
                     return None
                 #endif
             else:
                 cur = cur.children[match_name]
             #endif
         #endwhile
-
-        return cur
+              
+        term_name = namelist[-1]
+        if gather_suffixes:
+            term_name = qns_unsuffixed_basename(term_name)
+            suffixes = [c for c in cur.children.values()
+                        if c.is_terminal and c.unsuffixed_basename == term_name]
+            return suffixes if len(suffixes) > 0 else None
+        else:
+            if term_name in cur.children:
+                return cur.children[term_name]
+            elif build:
+                return cur.add_child(term_name, caused_by=caused_by)
+            else:
+                return None
+            #endif
+        #endif
         
     #enddef
 
-    def locate(self, qns, build=False, caused_by=None):
-        qn = self._locate(qns, build=build, caused_by=caused_by)
+    def locate(self, qns, build=False, gather_suffixes=False, caused_by=None):
+        qn = self._locate(qns, build=build,
+                          gather_suffixes=gather_suffixes,
+                          caused_by=caused_by)
         if qn == None:
             raise NotFoundExn("Could not find name {}".format(qns))
         #endif
@@ -567,6 +592,13 @@ class Context(object):
         #endif
 
     #enddef
+
+    def __getitem__(self, key):
+        v = self._locate(key, build=False)
+        if v == None: raise KeyError(key)
+        return v
+    #enddef
+    def __iter__(self): return iter(self.terminals())
     
 #endclass
 
@@ -598,7 +630,12 @@ def qns_suffix(qns):
     s = qns_basename(qns).split(_SUFFIX_DELIMITER, 1)
     return s[1] if len(s) == 2 else None
 #enddef
-    
+
+def qns_unsuffixed_basename(qns):
+    s = qns_basename(qns).split(_SUFFIX_DELIMITER, 1)
+    return s[0]
+#enddef
+
 def qns_add_suffix(qns, suffix):
     return qns + _SUFFIX_DELIMITER + suffix
 #enddef
@@ -845,7 +882,31 @@ class Test(event.EventTestCase):
 
         with self.assertRaises(NotFoundExn): ctx.locate("foo::dong")
         with self.assertRaises(NotFoundExn): ctx.locate("foo::boing")
-       
+
+
+        baz = ctx.root.add_child("baz")
+        baz_ding = baz.add_child("ding")
+        baz_dong_s1 = baz.add_child("dong$$s1")
+        baz_dong_s2 = baz.add_child("dong$$s2")
+
+        self.assertCountEqual(ctx.locate("baz::dong", gather_suffixes=True),
+                              [baz_dong_s1, baz_dong_s2])
+
+        self.assertCountEqual(ctx.locate("baz::dong$$xxx", gather_suffixes=True),
+                              [baz_dong_s1, baz_dong_s2])
+
+        self.assertCountEqual(ctx.locate("baz::ding", gather_suffixes=True),
+                              [baz_ding])
+        
+        baz_ding_s1 = baz.add_child("ding$$s1")
+
+        self.assertCountEqual(ctx.locate("baz::ding", gather_suffixes=True),
+                              [baz_ding, baz_ding_s1])
+
+        with self.assertRaises(NotFoundExn):
+            ctx.locate("baz::doh", gather_suffixes=True)
+        #endwith
+        
     #enddef
 
     def test_build(self):

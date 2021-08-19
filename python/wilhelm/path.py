@@ -89,7 +89,7 @@ from types import MethodType
 
 from . import ast
 
-__all__ = ["compile"]
+# __all__ = ["compile"]
 
 class Exn(Exception): pass
 

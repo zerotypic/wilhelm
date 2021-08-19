@@ -12,6 +12,8 @@ from .util import asyncutils
 
 (LOG, DCRIT, DERROR, DWARN, DINFO, DBG) = util.setup_logger(__name__)
 
+__all__ = []
+
 class IDAEvent(event.Event): pass
 
 class RenameEvent(IDAEvent):

@@ -45,7 +45,7 @@ Get the names of the callee of the call expressions:
 
 Get all calls expressions that are calling function at address `0x43213`:
 ```python
->>> calls = func.select("*/CallExpr[.e_func/GlobalVarExpr{addr = 0x43213}]"
+>>> calls = func.select("*/CallExpr[.e_func/GlobalVarExpr{addr = 0x43213}]")
 >>> list(calls)
 [<wilhelm.ast.CallExpr at 0xXXXXXXXXXXXX>,
  <wilhelm.ast.CallExpr at 0xXXXXXXXXXXXX>,

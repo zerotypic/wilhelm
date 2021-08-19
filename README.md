@@ -104,8 +104,13 @@ nodes they are, and expose relevant values as fields. A Visitor class can be
 used to traverse the AST.
 
 A NodeList represents a collection of AST nodes, and provides ways of mapping and
-filtering the list. This can be used to quickly locate a specific code of
+filtering the list. This can be used to quickly locate a specific node of
 interest.
+
+```python
+>>> list(nodelist.filter_class(W.ast.BinOpExpr).filter_test(lambda n: n.op == W.ast.OP.EQ))
+[<wilhelm.ast.BinOpExpr at 0xXXXXXXXXXXXX>]
+```
 
 ### AST Wilpaths
 

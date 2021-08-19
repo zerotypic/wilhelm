@@ -1,5 +1,5 @@
-wilhelm : Alternative API for IDA and Hex-Rays
-==============================================
+wilhelm: Alternative API for IDA and Hex-Rays
+=============================================
 
 wilhelm is an API for working with IDA, and in particular the Hex-Rays
 decompiler. It aims to wrap around the existing SDK's API, plus provide
@@ -36,7 +36,11 @@ Find all call expressions in the function:
 Get the names of the callee of the call expressions:
 ```python
 >>> [W.current().get_qname_for_addr(e.addr) for e in func.select("*/CallExpr.e_func/")]
-[QName<sub_15AC70>, QName<sub_15BE70>, QName<sub_15BE70>]
+[QName<sub_1412C0>, 
+ QName<sub_153DD0>, 
+ QName<sub_15DA70>, 
+ QName<sub_165120>, 
+ QName<sub_1664F0>]
 ```
 
 Get all calls expressions that are calling function at address `0x43213`:
@@ -57,10 +61,11 @@ Get string value of 2nd argument to the above calls:
 ## Dependencies
 
 wilhelm requires a working async event loop in IDAPython. The easiest way to
-get this is by installing `qasync`, which provides a Qt-based event loop. This
-loop must be initialized prior to loading wilhelm.
+get this is by installing [qasync](https://github.com/CabbageDevelopment/qasync/),
+which provides a Qt-based event loop. This loop must be initialized prior to loading 
+wilhelm.
 
-The optional `path` feature requires `pyparsing`.
+The optional `path` feature requires [pyparsing](https://pypi.org/project/pyparsing/).
 
 ## Installation
 
@@ -134,8 +139,8 @@ Some examples of wilpaths:
   The above, but instead of returning the global variable expressions,
   return the parent if statement.
 
-Please see the docstring in python/wilhelm/path.py for a complete description
-of the wilpath DSL.
+Please see the docstring in [path.py](/python/wilhelm/path.py) for a complete
+description of the wilpath DSL.
 
 ### Event System
 

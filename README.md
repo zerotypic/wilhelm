@@ -109,7 +109,7 @@ interest.
 
 ### AST Wilpaths
 
-The optional `path` feature provides /wilpaths/, which are a way to easily
+The optional `path` feature provides *wilpaths*, which are a way to easily
 navigate and select nodes in an AST. Inspired by the XPath query language for
 XML, a wilpath builds upon the filtering and mapping features of NodeLists.
 
@@ -159,7 +159,7 @@ particularly the type system.
 
 The `module` feature provides a way of accessing the currently-loaded IDA
 database (aka module). All objects in the database have an associated
-/qualified name/ (QName), which is kept in sync with the name used by
+*qualified name* (QName), which is kept in sync with the name used by
 IDA. QNames allow navigation and searching based on their structure: e.g. you
 can query for all names that are in a particular namespace like
 `foo::SomeClass`. Renaming a namespace also automatically updates the names

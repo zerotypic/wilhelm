@@ -107,7 +107,7 @@ asyncio.set_event_loop(loop)
 import wilhelm as W
 W.initialize()                             # Init with only core features
 # or:
-W.initialize(Feature.PATH, Feature.MODULE) # Init with optional features
+W.initialize(W.Feature.PATH, W.Feature.MODULE) # Init with optional features
 ```
 
 ## Features

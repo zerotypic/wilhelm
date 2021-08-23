@@ -5,6 +5,17 @@ wilhelm is an API for working with IDA, and in particular the Hex-Rays
 decompiler. It aims to wrap around the existing SDK's API, plus provide
 additional features and concepts that make reverse engineering easier.
 
+While wilhelm works well in scripts, it is also designed with the REPL
+in mind: it is tailored to be easy to use interactively, to help answer
+simple questions while reversing is taking place. For example, you can
+use it to search a group of functions for a specific code pattern. As
+such, wilhelm contains an event system, allowing it to react and
+update itself whenever the underlying IDB is modified.
+
+Currently, the main feature provided by wilhelm is convenient access to
+a decompiled function's AST. The next major feature to be added is type
+management.
+
 ## Example Usage
 
 Initialize:
@@ -60,12 +71,17 @@ Get string value of 2nd argument to the above calls:
 
 ## Dependencies
 
+Requires IDAPython 3, no support for Python 2.
+
 wilhelm requires a working async event loop in IDAPython. The easiest way to
 get this is by installing [qasync](https://github.com/CabbageDevelopment/qasync/),
 which provides a Qt-based event loop. This loop must be initialized prior to loading 
 wilhelm.
 
 The optional `path` feature requires [pyparsing](https://pypi.org/project/pyparsing/).
+
+Not a dependency, but using [ipyia](https://github.com/eset/ipyida) makes using wilhelm
+a lot easier.
 
 ## Installation
 

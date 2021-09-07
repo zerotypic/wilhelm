@@ -196,6 +196,12 @@ wilhelm.current().values["sub_12345"]().func.body[0].expr.e_lhs
 The module feature is currently in development, and hence optional, but it
 will eventually form a core part of wilhelm.
 
+## Known Bugs
+
+* The AST representation does not update when the function gets updated. This
+  will be fixed soon; the AST code was written before the event code, so it
+  needs to be updated to react to events like variable renaming.
+
 ## Credits
 
 TODO

@@ -486,11 +486,12 @@ class Context(object):
     def terminals(self, filter_entity_type=None):
         return self._root.terminals(filter_entity_type=filter_entity_type)
     #enddef
-
+    #
     # Internal function used to implement locate and build.
     # Notes:
     # - when gather_suffixes is True, look for all qnames that have the
-    #   queried unsuffixed basename.
+    #   queried unsuffixed basename. Returns qnames are all terminal values.
+    #
     def _locate(self, qns, build=False, gather_suffixes=False, caused_by=None):
         
         # Note: This list is guaranteed to contain at least 1 element.
@@ -558,7 +559,7 @@ class Context(object):
         For example, "foo:*:bar" matches qnames "foo::hello::bar", "foo::this::is::bar",
         as well as "foo::bar".
 
-        To match qnames with arbitrary parent identifiers, start the query with ":*". 
+        To match qnames with arbitrary parent identifiers, start the query with ":*:". 
         For example, ":*:foo" matches "this::is::foo", "also::foo" and "foo".
         '''
         return self.root.search(query, **kwargs)

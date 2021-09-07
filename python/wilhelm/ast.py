@@ -565,8 +565,25 @@ class GotoStmt(Stmt):
 
 class AsmStmt(Stmt): pass
 
+# Metaclass to enfore that there is only 1 Function instance per address.
+class FunctionFactoryMeta(type):
+    _store = {}
+    def __call__(cls, addr, *args, **kwargs):
+        if addr in FunctionFactoryMeta._store:
+            return FunctionFactoryMeta._store[addr]
+        else:
+            obj = type.__call__(cls, addr, *args, **kwargs)
+            FunctionFactoryMeta._store[addr] = obj
+            return obj
+        #endif
+    #enddef
+    @staticmethod
+    def clear_for_addr(addr):
+        del FunctionFactoryMeta._store[addr]
+    #enddef
+#endclass
 
-class Function(object):
+class Function(object, metaclass=FunctionFactoryMeta):
     '''
     A decompiled function. Roughly corresponds to HexRays' cfunc_t
     class. Functions an be created by providing an address within the
@@ -958,6 +975,9 @@ class Function(object):
 
     #enddef
 
+    @staticmethod
+    def clear_from_factory(addr): FunctionFactoryMeta.clear_for_addr(addr)
+    
 #endclass
 
 class Visitor(object):
@@ -1438,6 +1458,19 @@ class Test(unittest.TestCase):
         # XXX: Unit tests for NodeList.apply
        
     #enddef
-   
+
+    def test_factory(self):
+       
+        func1 = Function(self.func_addr)
+        func2 = Function(self.func_addr)
+
+        self.assertIs(func1, func2)
+
+        Function.clear_from_factory(self.func_addr)
+        func3 = Function(self.func_addr)
+        self.assertIsNot(func1, func3)
+        
+    #enddef
+    
     
 #endclass

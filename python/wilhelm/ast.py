@@ -15,6 +15,8 @@ from .util import TYPECHECK, CHECK_SUBTYPE, type_method
 from .util import lazylist
 from . import types
 from .types import WilType
+from . import event
+from . import ida_events
 
 __all__ = []
 
@@ -569,11 +571,16 @@ class AsmStmt(Stmt): pass
 class FunctionFactoryMeta(type):
     _store = {}
     def __call__(cls, addr, *args, **kwargs):
-        if addr in FunctionFactoryMeta._store:
-            return FunctionFactoryMeta._store[addr]
+        # Resolve 'addr' to a function start address.
+        ida_func = idaapi.get_func(addr)
+        if type(ida_func) == NoneType: raise NotAFunctionExn()
+        func_addr = ida_func.start_ea
+
+        if func_addr in FunctionFactoryMeta._store:
+            return FunctionFactoryMeta._store[func_addr]
         else:
             obj = type.__call__(cls, addr, *args, **kwargs)
-            FunctionFactoryMeta._store[addr] = obj
+            FunctionFactoryMeta._store[func_addr] = obj
             return obj
         #endif
     #enddef
@@ -583,7 +590,7 @@ class FunctionFactoryMeta(type):
     #enddef
 #endclass
 
-class Function(object, metaclass=FunctionFactoryMeta):
+class Function(event.Emitter, metaclass=FunctionFactoryMeta):
     '''
     A decompiled function. Roughly corresponds to HexRays' cfunc_t
     class. Functions an be created by providing an address within the
@@ -975,8 +982,25 @@ class Function(object, metaclass=FunctionFactoryMeta):
 
     #enddef
 
+    # XXX: Change below to classmethods and access metaclass using type() instead?
+    
     @staticmethod
     def clear_from_factory(addr): FunctionFactoryMeta.clear_for_addr(addr)
+
+    @staticmethod
+    def _handle_ida_local_rename(ev):
+        assert isinstance(ev, ida_events.HexRaysLocalRenameEvent)
+        if ev.addr in FunctionFactoryMeta._store:
+            func = Function(ev.addr)
+            hx_idx = list(func.hx_func.lvars).index(ev.lvar)
+            lvar = func._hx_lvars_mapping[hx_idx]
+            lvar.name = ev.new_name
+            DBG("Updated lvar name to %s", ev.new_name)
+            # XXX: Emit event?
+        else:
+            DINFO("Ignoring unseen function local rename at addr: 0x%08x", ev.addr)
+        #endif
+    #enddef
     
 #endclass
 
@@ -1112,6 +1136,19 @@ _hxop_map = {
 }
 
 ###############################################
+# MODULE INIT
+###############################################
+
+async def _module_init(mod):
+    print("Initializing AST module.")
+    event.manager._register_handler(ida_events.HexRaysLocalRenameEvent,
+                                    Function._handle_ida_local_rename,
+                                    priority=-99)
+    return
+#enddef
+
+
+###############################################
 # UTILITY FUNCTIONS
 ###############################################
 
@@ -1124,6 +1161,7 @@ def from_addr(ea = None):
     return func.find_by_addr(ea)
 
 #enddef
+
 
 #
 # UNIT TESTS

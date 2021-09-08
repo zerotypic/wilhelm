@@ -33,6 +33,16 @@ class RenameEvent(IDAEvent):
     #enddef
 #endclass
 
+class HexRaysLocalRenameEvent(IDAEvent):
+    def __init__(self, addr, lvar, new_name, is_user_name, **kwargs):
+        super().__init__(**kwargs)
+        self.addr = addr
+        self.lvar = lvar
+        self.new_name = new_name
+        self.is_user_name = is_user_name
+    #enddef
+#endclass
+
 def suppressable(func):
     def _wrap(self, *args, **kwargs):
         if self._ctx.suppress_events: return 0
@@ -217,6 +227,66 @@ class IDBHooks(idaapi.IDB_Hooks):
     
 #endclass
 
+class HexRaysHooks(idaapi.Hexrays_Hooks):
+
+    def __init__(self, ctx):
+        super().__init__()
+        self._ctx = ctx
+    #enddef
+
+    def lvar_name_changed(self, vu, v, name, is_user_name):
+        addr = vu.cfunc.entry_ea
+        ev = HexRaysLocalRenameEvent(addr, v, name, is_user_name)
+        event.manager.trigger(ev)
+        return super().lvar_name_changed(vu, v, name, is_user_name)
+    #enddef
+
+    # def lvar_type_changed(self, vu, v, tinfo) -> int
+    #def lvar_cmt_changed(self, vu, v, cmt) -> int
+
+    # def lvar_mapping_changed(self, vu, frm, to):
+    #     pass
+    # #enddef
+
+    # XXX TODO
+    # flowchart(self, fc) -> int
+    # stkpnts(self, mba, _sps) -> int
+    # prolog(self, mba, fc, reachable_blocks, decomp_flags) -> int
+    # microcode(self, mba) -> int
+    # preoptimized(self, mba) -> int
+    # locopt(self, mba) -> int
+    # prealloc(self, mba) -> int
+    # glbopt(self, mba) -> int
+    # structural(self, ct) -> int
+    # maturity(self, cfunc, new_maturity) -> int
+    # interr(self, errcode) -> int
+    # combine(self, blk, insn) -> int
+    # print_func(self, cfunc, vp) -> int
+    # func_printed(self, cfunc) -> int
+    # resolve_stkaddrs(self, mba) -> int
+    # build_callinfo(self, blk, type, callinfo) -> int
+    # open_pseudocode(self, vu) -> int
+    # switch_pseudocode(self, vu) -> int
+    # refresh_pseudocode(self, vu) -> int
+    # close_pseudocode(self, vu) -> int
+    # keyboard(self, vu, key_code, shift_state) -> int
+    # right_click(self, vu) -> int
+    # double_click(self, vu, shift_state) -> int
+    # curpos(self, vu) -> int
+    # create_hint(self, vu) -> PyObject *
+    # text_ready(self, vu) -> int
+    # populating_popup(self, widget, popup_handle, vu) -> int
+    # lvar_name_changed(self, vu, v, name, is_user_name) -> int
+    # lvar_type_changed(self, vu, v, tinfo) -> int
+    # lvar_cmt_changed(self, vu, v, cmt) -> int
+    # lvar_mapping_changed(self, vu, frm, to) -> int
+    # cmt_changed(self, cfunc, loc, cmt) -> int
+
+    
+
+#endclass
+
+
 _ctx = _Context()
 
 idphook = IDPHooks(_ctx)
@@ -224,6 +294,9 @@ idphook.hook()
 
 idbhook = IDBHooks(_ctx)
 idbhook.hook()
+
+hrhook = HexRaysHooks(_ctx)
+hrhook.hook()
 
 @contextlib.contextmanager
 def suppress_events():
@@ -243,4 +316,5 @@ def cleanup():
     print("Cleanup called.")
     idphook.unhook()
     idbhook.unhook()
+    hrhook.unhook()
 #enddef

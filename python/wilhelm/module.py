@@ -462,8 +462,8 @@ class Test(unittest.TestCase):
 
         mod = Module()
 
-        self.assertEqual(type(mod.value_context), qname.Context)
-        self.assertEqual(type(mod.type_context), qname.Context)
+        self.assertIsInstance(mod.value_context, qname.Context)
+        self.assertIsInstance(mod.type_context, qname.Context)
         
     #enddef
 

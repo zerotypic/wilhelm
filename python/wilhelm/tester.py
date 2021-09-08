@@ -19,7 +19,9 @@ class TestSetupExn(Exn): pass
 
 def get_tests_from_module(mod_name, pkgname):
     mod = importlib.import_module("." + mod_name, package=pkgname)
-    importlib.reload(mod)
+    # Don't reload as it will cause problems with other modules referencing
+    # the previous module.
+    #importlib.reload(mod)
     if "Test" in mod.__dict__:
         t = mod.__dict__["Test"]
         if issubclass(t, unittest.TestCase):
@@ -55,7 +57,7 @@ def run_tests(mod_names=None, stream=None, verbosity=2):
                         if not is_pkg]
         mod_names = main_modules + util_modules
     #endif
-    
+   
     for mod_name in mod_names:
         try:
             tests = get_tests_from_module(mod_name, pkg.__name__)

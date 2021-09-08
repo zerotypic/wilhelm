@@ -10,7 +10,7 @@ class TypecheckExn(Exn): pass
 
 def TYPECHECK(v, ty):
     if not issubclass(type(v), ty):
-        raise TypecheckExn("Value {} has type {}, and not of type {}.".format(
+        raise TypecheckExn("Value {} has type {}, which is incompatible with type {}.".format(
             repr(v),
             repr(type(v)),
             repr(ty)))

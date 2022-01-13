@@ -13,10 +13,14 @@ import idaapi
 from . import util
 from .util import TYPECHECK, CHECK_SUBTYPE, type_method
 from .util import lazylist
+from .util import lazy
+from . import module
 from . import types
 from .types import WilType
 from . import event
 from . import ida_events
+
+(LOG, DCRIT, DERROR, DWARN, DINFO, DBG) = util.setup_logger(__name__)
 
 __all__ = []
 
@@ -126,6 +130,15 @@ class Node(object):
         #endtry
     #enddef
 
+    def __dir__(self):
+        return [
+            n[1:] if n.startswith("_")
+            else n
+            for n in self.__dict__.keys()
+            if not n.startswith("__")
+        ]
+    #enddef
+    
     @property
     def _children(self):
         return NodeList((getattr(self, x) for x in self.__dict__ 
@@ -567,37 +580,13 @@ class GotoStmt(Stmt):
 
 class AsmStmt(Stmt): pass
 
-# Metaclass to enfore that there is only 1 Function instance per address.
-class FunctionFactoryMeta(type):
-    _store = {}
-    def __call__(cls, addr, *args, **kwargs):
-        # Resolve 'addr' to a function start address.
-        ida_func = idaapi.get_func(addr)
-        if type(ida_func) == NoneType: raise NotAFunctionExn()
-        func_addr = ida_func.start_ea
-
-        if func_addr in FunctionFactoryMeta._store:
-            return FunctionFactoryMeta._store[func_addr]
-        else:
-            obj = type.__call__(cls, addr, *args, **kwargs)
-            FunctionFactoryMeta._store[func_addr] = obj
-            return obj
-        #endif
-    #enddef
-    @staticmethod
-    def clear_for_addr(addr):
-        del FunctionFactoryMeta._store[addr]
-    #enddef
-#endclass
-
-class Function(event.Emitter, metaclass=FunctionFactoryMeta):
+@module.Item.register_handler(idaapi.is_func)
+class Function(module.Item):
     '''
     A decompiled function. Roughly corresponds to HexRays' cfunc_t
     class. Functions an be created by providing an address within the
     function to be decompiled.
     '''
-
-    addr = None
 
     hx_func = None
 
@@ -622,25 +611,28 @@ class Function(event.Emitter, metaclass=FunctionFactoryMeta):
 
     _ea_mapping = None
 
+    @classmethod
+    def _normalize_addr(cls, addr):
+        ida_func = idaapi.get_func(addr)
+        if ida_func == None: raise NotAFunctionExn()
+        return ida_func.start_ea
+    #enddef
+    
     def __init__(self, addr):
         '''
         Creates a new Function object.
-        @param addr An address in the function to be decompiled.
+        :param addr: An address in the function to be decompiled.
         '''
 
-        ida_func = idaapi.get_func(addr)
+        super().__init__(addr)
 
-        # IDAPython has problems when we try to do ida_func == None, so
-        # use the type instead.
-        if type(ida_func) == NoneType: raise NotAFunctionExn()
-            
-        # Set address to starting address of the function that addr is in.
-        self.addr = ida_func.start_ea
-
-        self.hx_func = idaapi.decompile(addr)
+        self.hx_func = idaapi.decompile(self.addr)
         if type(self.hx_func) == NoneType: raise DecompilationExn()
 
         self._init_lvars()
+
+        # Map from a label index to an expression. We use the same label
+        # number as HexRays.
         self.label_mapping = {}
         self._ea_mapping = {}
         
@@ -649,14 +641,20 @@ class Function(event.Emitter, metaclass=FunctionFactoryMeta):
     #enddef
 
     def _init_lvars(self):
+        # Note that lvars is a superset of args; it includes both the local
+        # variables as well as the arguments.
         self.lvars = [LocalVariable(lvar.name, 
                                     WilType(lvar.tif),
                                     lvar.width,
                                     is_param=lvar.is_arg_var)
                       for lvar in self.hx_func.lvars]
-    
         self.args = [v for v in self.lvars if v.is_param]
 
+        # Mapping from HexRays local variable index to a local variable object.
+        # Currently the actual mapping is direct; the HexRays index is
+        # the same as our index into self.lvars. However we keep this mapping
+        # here in case in future we might re-order or insert/delete items from
+        # self.lvars.
         self._hx_lvars_mapping = dict(enumerate(self.lvars))
 
     #enddef
@@ -982,16 +980,14 @@ class Function(event.Emitter, metaclass=FunctionFactoryMeta):
 
     #enddef
 
-    # XXX: Change below to classmethods and access metaclass using type() instead?
-    
-    @staticmethod
-    def clear_from_factory(addr): FunctionFactoryMeta.clear_for_addr(addr)
+    @classmethod
+    def clear_from_factory(cls, addr): cls._lazy_factory_purge_key(addr)
 
-    @staticmethod
-    def _handle_ida_local_rename(ev):
+    @classmethod
+    def _handle_ida_local_rename(cls, ev):
         assert isinstance(ev, ida_events.HexRaysLocalRenameEvent)
-        if ev.addr in FunctionFactoryMeta._store:
-            func = Function(ev.addr)
+        if ev.addr in cls._lazy_factory_get_cache():
+            func = cls(ev.addr)
             hx_idx = list(func.hx_func.lvars).index(ev.lvar)
             lvar = func._hx_lvars_mapping[hx_idx]
             lvar.name = ev.new_name

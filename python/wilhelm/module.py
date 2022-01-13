@@ -11,9 +11,10 @@ import idautils
 from . import qname
 from . import event
 from . import ida_events
-from . import ast
 from . import util
 from .util import asyncutils
+from .util import lazy
+from .util import TYPECHECK
 
 (LOG, DCRIT, DERROR, DWARN, DINFO, DBG) = util.setup_logger(__name__)
 
@@ -33,65 +34,79 @@ class HasSuffixesExn(Exn): pass
 # Items are designed to be lazy by default, holding only their address. To
 # access other values associated with an item, the item must be "called"
 # first: item().some_value
-class Item(object):
+class Item(event.Emitter, metaclass=lazy.LazyFactoryMeta):
+
+    @classmethod
+    def _normalize_addr(cls, addr):
+        '''Returns the normalized version of `addr` for this class of item.
+
+        This is useful in cases where an item can span across multiple
+        addresses; normalization will return a consistent unique address that
+        can be used to identify this item, e.g. the starting address.
+        
+        Subclasses of Item can override this as required.
+        '''
+        return addr
+    #enddef
+
+    
     def __init__(self, addr):
-        self._addr = addr
-        self._is_lazy = True
+        self._addr = self._normalize_addr(addr)
+    #enddef
+
+    def __lazy_preinit__(self, addr, *args, **kwargs):
+        # Note: When the object is lazy, the `addr` property isn't set up
+        # yet. So, we can directly set `addr` on the lazy object to allow
+        # access to that value before reification. However, because `addr` is
+        # a property, Python doesn't allow us to directly set it via dotted
+        # notation (self.addr), probably because some check identifies it as a
+        # property. So, we have to set the value in `__dict__` instead. This
+        # works fine, as while the object is lazy, trying to access `addr`
+        # will just trigger a `__dict__` lookup.
+        self.__dict__["addr"] = self._normalize_addr(addr)
+    #enddef
+    
+    @classmethod
+    def _lazy_factory_get_key(cls, addr, *args, **kwargs):
+        return cls._normalize_addr(addr)
     #enddef
 
     @property
     def addr(self): return self._addr
 
-    @property
-    def is_lazy(self): return self._is_lazy
-    
-    def realize(self): pass
-    
-    def __call__(self):
-        if self._is_lazy:
-            self.realize()
-            self._is_lazy = False
-        #endif
-        return self
+    __handlers = []
+
+    @classmethod
+    def register_handler(cls, test_func):
+        def _register_handler(item_cls):
+            #TYPECHECK(item_cls, cls)
+            cls.__handlers.append((test_func, item_cls))
+            return item_cls
+        #enddef
+        return _register_handler
     #enddef
     
     @classmethod
     def build_item_from_addr(cls, addr):
-
+        # XXX: Handle case where addr is invalid.
         flags = idaapi.get_full_flags(addr)
 
-        if idaapi.is_func(flags):
-            return FunctionItem(addr)
-        elif idaapi.is_data(flags):
-            return DataItem(addr)
-        else:
-            return Item(addr)
-        #endif
+        for (test_func, item_cls) in cls.__handlers:
+            if test_func(flags):
+                return item_cls(addr)
+            #endif
+        #endfor
 
-    #enddef
+        return Item(addr)
     
-#endclass
-
-class FunctionItem(Item):
-    def __init__(self, addr):
-        super().__init__(addr)
-        self._func = None
-    #enddef
-
-    def realize(self):
-        self._func = ast.Function(self.addr)
-    #enddef
-
-    @property
-    def func(self):
-        if self._func == None: self()
-        return self._func
     #enddef
     
 #endclass
 
 # XXX: Add more specialized subclasses for different kinds of
 # data types. 
+
+@Item.register_handler(idaapi.is_data)
 class DataItem(Item):
     def __init__(self, addr):
         super().__init__(addr)

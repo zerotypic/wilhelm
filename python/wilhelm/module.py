@@ -50,7 +50,8 @@ class Item(event.Emitter, metaclass=lazy.LazyFactoryMeta):
     #enddef
 
     
-    def __init__(self, addr):
+    def __init__(self, addr, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         self._addr = self._normalize_addr(addr)
     #enddef
 
@@ -154,6 +155,10 @@ class ValueContext(qname.Context):
         #endif
     #enddef
 
+    def get_by_addr(self, addr):
+        return self._parent_module.get_qname_for_addr(addr).entity
+    #enddef
+    
     def get_suffixes(self, qns):
         '''Retrieves all suffixes of the provided QName.
 
@@ -168,7 +173,7 @@ class ValueContext(qname.Context):
         '''Returns a QName object from the value context.'''
         return self.locate(qns)
     #enddef            
-    
+
     def add(self, qns, addr, caused_by=None):
         '''Add a new item to the value context.
 
@@ -187,13 +192,19 @@ class ValueContext(qname.Context):
         #endif
         return qn
     #enddef
-
+   
     def __getitem__(self, key):
-        try:
-            return self.get(key)
-        except (qname.NotFoundExn, NotTerminalExn):
-            raise KeyError(key)
-        #endtry
+        if type(key) == int:
+            # Treat as an address
+            return self.get_by_addr(key)
+        else:
+            # Treat as qname string.
+            try:
+                return self.get(key)
+            except (qname.NotFoundExn, NotTerminalExn):
+                raise KeyError(key)
+            #endtry
+        #endif
     #enddef
     def __iter__(self):
         return (it.entity for it in super().__iter__())

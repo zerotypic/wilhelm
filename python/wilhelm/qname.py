@@ -115,7 +115,8 @@ class EntityChangeEvent(QNameEvent):
 BRG_PARENT = event.Bearing("qname.parent")
 BRG_CHILDREN = event.Bearing("qname.children")
 
-class Root(BRG_PARENT.Relay, BRG_CHILDREN.Relay):
+@event.Relay.register(BRG_PARENT, BRG_CHILDREN)
+class Root(event.Relay):
 
     def __init__(self, ctx):
         TYPECHECK(ctx, Context)
@@ -297,6 +298,7 @@ class Root(BRG_PARENT.Relay, BRG_CHILDREN.Relay):
 
 #endclass
 
+@event.Relay.register(BRG_PARENT, BRG_CHILDREN)
 class QName(Root):
     '''
     A qualified name (QName) is a name within a namespace. It consists of
@@ -660,64 +662,11 @@ class Test(event.EventTestCase):
     def assertEventsMatch(self, events, specs,
                           includes_bearings=False,
                           include_origin=False):
-        # specs should be a list of 'spec' objects, where a spec is of the
-        # form: (<event type>, <property list>),
-        # or ((<bearing>, <event type>), <property list>) if
-        # includes_bearings is True.
-        # <property list> is a list of 2-tuples (<name>, <value>) where
-        # <name> is the name of an event property, and <value> is the
-        # expected value of that property.
-        # We ignore the "ctx" property, so that does not need to be
-        # included in the spec list.
-
-        # To perform the match, we sort the event list and the spec list.
-
-        def get_event_properties(ev):
-            props = [(k, v) for (k, v) in ev.__dict__.items()
-                     if not k.startswith("_") and not k == "ctx"]
-            if include_origin: props.append(("origin", ev.origin))
-            return props
-        #enddef
-
-        if includes_bearings:
-            def event_info(bev): return ((bev[0], type(bev[1])), get_event_properties(bev[1]))
-            def event_sort_key(bev):
-                ((bearing, evtype), props) = event_info(bev)
-                return (bearing, repr(evtype), repr(props))
-            #enddef
-            def spec_sort_key(spec):
-                ((bearing, event), props) = spec
-                return ((bearing, repr(event)), repr(props))
-            #enddef
-        else:
-            def event_info(ev): return (type(ev), get_event_properties(ev))
-            def event_sort_key(ev):
-                (evtype, props) = event_info(ev)
-                return (repr(evtype), repr(props))
-            #enddef
-            def spec_sort_key(spec):
-                (event, props) = spec
-                return (repr(event), repr(props))
-            #enddef
-        #endif
-
-        sorted_events = sorted(events, key=event_sort_key)
-        sorted_specs = sorted(specs, key=spec_sort_key)
-
-        if len(sorted_events) != len(sorted_specs):
-            self.fail("Event list does not match spec:\nEvents:\t{}\nSpecs:\t{}".format(
-                sorted_events, sorted_specs))
-        #endif
-                
-        for (i, ev) in enumerate(sorted_events):
-            (ev_type, ev_props) = event_info(ev)
-            (spec_type, spec_props) = sorted_specs[i]
-
-            self.assertEqual(ev_type, spec_type)
-            self.assertCountEqual(ev_props, spec_props)
-            
-        #endfor
-
+        return super().assertEventsMatch(
+            events, specs,
+            includes_bearings=includes_bearings,
+            include_origin=include_origin,
+            ignore_props=("ctx",))
     #enddef
     
     def test_context(self):

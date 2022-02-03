@@ -9,6 +9,7 @@ from types import GeneratorType, MethodType
 NoneType = type(None)
 
 import idaapi
+import idautils
 
 from . import util
 from .util import TYPECHECK, CHECK_SUBTYPE, type_method
@@ -31,6 +32,48 @@ class NotAFunctionExn(Exn): pass
 class AddressOutOfRangeExn(Exn): pass
 class NonCallableAttributeExn(Exn): pass
 class NonNodeAttributeExn(Exn): pass
+
+class ASTEvent(event.Event):
+    '''Events related to the AST of a decompiled function.
+    '''
+
+    def __init__(self, func, **kwargs):
+        super().__init__(tag=func.addr, **kwargs)
+        self.func = func
+    #enddef
+
+#endclass
+
+class LocalVarRenameEvent(ASTEvent):
+    '''Triggered after local variable is renamed.'''
+    def __init__(self, func, lvar, old_name, new_name, **kwargs):
+        super().__init__(func, **kwargs)
+        self.lvar = lvar
+        self.old_name = old_name
+        self.new_name = new_name
+    #enddef
+#endclass
+
+class LocalVarTypeChangeEvent(ASTEvent):
+    '''Triggered after local variable's type is changed.'''
+    def __init__(self, func, lvar, old_ty, new_ty, **kwargs):
+        super().__init__(func, **kwargs)
+        self.lvar = lvar
+        self.old_ty = old_ty
+        self.new_ty = new_ty
+    #enddef
+#endclass
+
+class FunctionSignatureChangeEvent(ASTEvent):
+    '''Triggered after a function's type signature is changed.'''
+    def __init__(self, func, old_ty, new_ty, **kwargs):
+        super().__init__(func, **kwargs)
+        self.old_ty = old_ty
+        self.new_ty = new_ty
+    #enddef
+#endclass
+
+# XXX: Add more events.
 
 # Operators
 OP = enum.Enum("OP", (
@@ -75,25 +118,83 @@ OP = enum.Enum("OP", (
     "FNEG",
 ))
 
-class LocalVariable(object):
+BRG_LVAR_PARENT = event.Bearing("ast.lvar_parent")
+BRG_FUNC_LVARS = event.Bearing("ast.func_lvars")
+
+@event.Relay.register(BRG_LVAR_PARENT, BRG_FUNC_LVARS)
+class LocalVariable(event.Relay):
     '''
     A local variable within a function scope.
     '''
 
-    name = ""
-    ty = None
-
-    # XXX: Type should contain width
-    def __init__(self, name, ty, width, is_param=False):
-        self.name = name
-        self.ty = ty
-        self.width = width
-        self.is_param = is_param
+    def __init__(self, func, hx_lvar, name, ty, is_param=False, **kwargs):
+        super().__init__(**kwargs)
+        self._name = name
+        self._ty = ty
+        self._is_param = is_param
+        self._func = func
+        self._hx_lvar = hx_lvar
     #enddef
 
+    @BRG_LVAR_PARENT.adjacents_property
+    def _lvar_parent_adjacents(self): return self._func
+
+    @BRG_FUNC_LVARS.adjacents_property
+    def _func_lvars_adjacents(self): return None
+    
+    @property
+    def name(self): return self._name
+
+    @name.setter
+    def name(self, value): self.set_name(value)
+
+    @property
+    def ty(self): return self._ty
+
+    @ty.setter
+    def ty(self, value): self.set_type(value)
+    
+    @property
+    def is_param(self): return self._is_param
+
+    def set_name(self, new_name):
+        lsi = idaapi.lvar_saved_info_t()
+        lsi.ll = self._hx_lvar
+        lsi.name = new_name
+        # XXX: Check return value
+        idaapi.modify_user_lvar_info(self._func.addr, idaapi.MLI_NAME, lsi)
+        old_name = self._name
+        self._name = new_name
+        self.emit_event(LocalVarRenameEvent, self._func, self, old_name, new_name)
+    #enddef
+
+    def set_type(self, new_ty):
+        lsi = idaapi.lvar_saved_info_t()
+        lsi.ll = self._hx_lvar
+        lsi.type = new_ty.to_tinfo()
+        # XXX: Check return value
+        idaapi.modify_user_lvar_info(self._func.addr, idaapi.MLI_TYPE, lsi)
+        old_ty = self._ty
+        self._ty = new_ty
+        self._func._emit_events_for_var_type_change(self, old_ty, new_ty)
+    #enddef
+
+    @classmethod
+    def _from_hexrays(cls, func, hx_lvar):
+        return cls(func,
+                   hx_lvar,
+                   hx_lvar.name,
+                   types.WilType.from_tinfo(hx_lvar.tif),
+                   is_param=hx_lvar.is_arg_var)
+    #enddef        
+    
 #endclass
 
-class Node(object):
+BRG_PARENT = event.Bearing("ast.parent")
+BRG_CHILDREN = event.Bearing("ast.children")
+
+@event.Relay.register(BRG_PARENT,  BRG_CHILDREN)
+class Node(event.Relay):
     '''
     Base class for AST nodes. Nodes have a parent, and children, which can
     be accessed via the .parent and .children attributes. The children of
@@ -111,6 +212,7 @@ class Node(object):
                  parent = None,
                  parent_func = None,
                  hexrays_item = None):
+        super().__init__()
         self._parent = parent
         self._parent_func = parent_func
         self._ea = hexrays_item.ea
@@ -136,15 +238,21 @@ class Node(object):
             else n
             for n in self.__dict__.keys()
             if not n.startswith("__")
-        ]
+        ] + super().__dir__()
     #enddef
-    
+
     @property
     def _children(self):
         return NodeList((getattr(self, x) for x in self.__dict__ 
                 if not x.startswith("_") and
                 issubclass(type(getattr(self, x)), Node)))
     #enddef
+
+    @BRG_PARENT.adjacents_property
+    def _parent_node(self): return self.parent
+
+    @BRG_CHILDREN.adjacents_property
+    def _children_nodes(self): return self.children
 
     def visit(self, visitor):
         visitor.visit(self)
@@ -580,36 +688,19 @@ class GotoStmt(Stmt):
 
 class AsmStmt(Stmt): pass
 
+
+# Bearings for functions
+BRG_CALLERS = event.Bearing("ast.callers")
+BRG_CALLEES = event.Bearing("ast.callees")
+
 @module.Item.register_handler(idaapi.is_func)
-class Function(module.Item):
+@event.Relay.register(BRG_CALLERS, BRG_CALLEES, BRG_LVAR_PARENT, BRG_FUNC_LVARS)
+class Function(module.Item, event.Relay):
     '''
     A decompiled function. Roughly corresponds to HexRays' cfunc_t
     class. Functions an be created by providing an address within the
     function to be decompiled.
     '''
-
-    hx_func = None
-
-    # Note that lvars is a superset of args; it includes both the local
-    # variables as well as the arguments.
-    lvars = []
-
-    args = []
-
-    body = None
-
-    # Map from a label index to an expression. We use the same label
-    # number as HexRays.
-    label_mapping = None
-
-    # Mapping from HexRays local variable index to a local variable object.
-    # Currently the actual mapping is direct; the HexRays index is
-    # the same as our index into self.lvars. However we keep this mapping
-    # here in case in future we might re-order or insert/delete items from
-    # self.lvars.
-    _hx_lvars_mapping = None
-
-    _ea_mapping = None
 
     @classmethod
     def _normalize_addr(cls, addr):
@@ -637,16 +728,20 @@ class Function(module.Item):
         self._ea_mapping = {}
         
         self.body = self._from_hexrays(self.hx_func.body)
-                                
+
+        ti = idaapi.tinfo_t()
+        self.hx_func.get_func_type(ti)        
+        self._func_ty = types.WilType.from_tinfo(ti)
+
+        # XXX: Verify that func_ty matches the types of the arguments to the
+        # function?
+        
     #enddef
 
     def _init_lvars(self):
         # Note that lvars is a superset of args; it includes both the local
         # variables as well as the arguments.
-        self.lvars = [LocalVariable(lvar.name, 
-                                    WilType(lvar.tif),
-                                    lvar.width,
-                                    is_param=lvar.is_arg_var)
+        self.lvars = [LocalVariable._from_hexrays(self, lvar)
                       for lvar in self.hx_func.lvars]
         self.args = [v for v in self.lvars if v.is_param]
 
@@ -659,6 +754,17 @@ class Function(module.Item):
 
     #enddef
 
+    @property
+    def func_ty(self): return self._func_ty
+
+    # XXX: Setter for func_ty
+    
+    @BRG_FUNC_LVARS.adjacents_property
+    def _lvars_adjacents(self): return self.lvars
+
+    @BRG_LVAR_PARENT.adjacents_property
+    def _lvar_parent_adjacents(self): return None
+    
     # Internal helper function to convert a HexRays item into a Wilhelm
     # AST node.
     def _from_hexrays(self, hx):
@@ -980,6 +1086,57 @@ class Function(module.Item):
 
     #enddef
 
+    @staticmethod
+    def _get_func_addr(addr): return idaapi.get_func(addr).start_ea
+    
+    def callers(self):
+        mod = module.current()
+        return set([mod.get_qname_for_addr(self._get_func_addr(addr))
+                    for addr in idautils.CodeRefsTo(self.addr, False)])
+    #enddef    
+
+    @BRG_CALLERS.adjacents_property
+    def _caller_adjacents(self):
+        # Only return non-lazy entities.
+        return [x.entity for x in self.callers() if not lazy.is_lazy(x.entity)]
+    #enddef
+
+    def callees(self):
+        mod = module.current()
+        return set([mod.get_qname_for_addr(self._get_func_addr(f.e_func.addr))
+                    for f in self.body.children.all().filter_class(CallExpr)
+                    if isinstance(f.e_func, GlobalVarExpr)])
+    #enddef
+
+    @BRG_CALLEES.adjacents_property
+    def _callee_adjacents(self):
+        # Only return non-lazy entities.
+        return [x.entity for x in self.callees() if not lazy.is_lazy(x.entity)]
+    #enddef    
+
+    @staticmethod
+    def _make_sig(arg_tys, ret_ty):
+        # XXX: Implement!
+        return None
+    #enddef
+    
+    def _emit_events_for_var_type_change(self, lvar, old_ty, new_ty):
+        lvar.emit_event(LocalVarTypeChangeEvent, self, lvar, old_ty, new_ty)
+        if lvar.is_param:
+            # XXX: Get return type from self.func_ty properly.
+            ret_ty = None
+            old_sig = self._make_sig(
+                [a.ty if lvar != a else old_ty for a in self.args],
+                ret_ty
+            )
+            new_sig = self._make_sig(
+                [a.ty for a in self.args],
+                ret_ty
+            )
+            self.emit_event(FunctionSignatureChangeEvent, self, old_sig, new_sig)
+        #endif
+    #enddef
+    
     @classmethod
     def clear_from_factory(cls, addr): cls._lazy_factory_purge_key(addr)
 
@@ -992,7 +1149,6 @@ class Function(module.Item):
             lvar = func._hx_lvars_mapping[hx_idx]
             lvar.name = ev.new_name
             DBG("Updated lvar name to %s", ev.new_name)
-            # XXX: Emit event?
         else:
             DINFO("Ignoring unseen function local rename at addr: 0x%08x", ev.addr)
         #endif
@@ -1140,6 +1296,7 @@ async def _module_init(mod):
     event.manager._register_handler(ida_events.HexRaysLocalRenameEvent,
                                     Function._handle_ida_local_rename,
                                     priority=-99)
+    # XXX: Add a handler for variable type changes.
     return
 #enddef
 
@@ -1165,9 +1322,10 @@ def from_addr(ea = None):
 
 import unittest
 
-class Test(unittest.TestCase):
+class Test(event.EventTestCase):
 
     def setUp(self):
+        super().setUp()
         self.func_addr = idaapi.get_name_ea(idaapi.BADADDR, "test_ast")
         if self.func_addr == idaapi.BADADDR:
             raise tester.TestSetupExn("Could not find 'test_ast' function.")
@@ -1176,11 +1334,11 @@ class Test(unittest.TestCase):
     #enddef
 
     def assertLocalVarExpr(self, node, name, width):
+        # XXX: Currently ignoring width as it will be determined from the type.
         # XXX: Check local variable type too.
         self.assertIsInstance(node, LocalVarExpr)
         self.assertIsInstance(node.lvar, LocalVariable)
         self.assertEqual(node.lvar.name, name)
-        self.assertEqual(node.lvar.width, width)
     #enddef        
 
     def test_basic(self):
@@ -1505,6 +1663,66 @@ class Test(unittest.TestCase):
         self.assertIsNot(func1, func3)
         
     #enddef
+
+    def test_lvar_mod(self):
+
+        func = Function(self.func_addr)
+        lvar = func.lvars[5]
+        self.assertEqual(lvar.name, "v5")
+        lvar.name = "newname"
+        self.assertEqual(lvar.name, "newname")
+
+        # XXX: Test changing types.
+        
+        # Reset to original values
+        lvar.name = "v5"
+        
+    #enddef
+
+    def test_events(self):
+
+        func = Function(self.func_addr)
+       
+        manager = event.manager
+        
+        manager.reset()
+
+        all_events = []
+        manager.register_handler(ASTEvent, lambda ev: all_events.append(ev))
+
+        # Test lvar renaming event.
+        lvar = func.lvars[5]
+        lvar.name = "newname"
+        self.wait_for_events()
+        self.assertEventsMatch(all_events, (
+            (LocalVarRenameEvent, (("func", func),
+                                   ("lvar", lvar),
+                                   ("old_name", "v5"),
+                                   ("new_name", "newname"))),
+        ))
+
+        # Test lvar bearings
+
+        manager.reset()
+        func_events = []
+        func.add_relay_event_observer(lambda *args: func_events.append(args))
+        lvar.name = "v5"
+        self.wait_for_events()
+        self.maxDiff = None
+        self.assertEventsMatch(func_events, (
+            ((BRG_LVAR_PARENT, LocalVarRenameEvent), (("func", func),
+                                                      ("lvar", lvar),
+                                                      ("old_name", "newname"),
+                                                      ("new_name", "v5"))),
+        ), includes_bearings = True)
+
+        # XXX: Test BRG_FUNC_LVARS.
+        
+        # XXX: Test caller/callee bearings
+        
+    #enddef
     
     
+    # XXX: Test type-related code and events.
+
 #endclass

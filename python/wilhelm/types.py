@@ -8,6 +8,13 @@ class WilType:
     def __init__(self, tinfo):
         self._tinfo = tinfo
     #enddef
+
+    def to_tinfo(self): return self._tinfo
+
+    @classmethod
+    def from_tinfo(cls, tinfo):
+        return cls(tinfo)
+    #enddef
     
 #endclass
 

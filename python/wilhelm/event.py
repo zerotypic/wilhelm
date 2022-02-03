@@ -18,7 +18,6 @@ class UnknownHandlerExn(Exn): pass
 class InvalidHandlerExn(Exn): pass
 class InvalidObserverExn(Exn): pass
 class UnknownObserverExn(Exn): pass
-class InvalidBearingExn(Exn): pass
 class InvalidRelayExn(Exn): pass
 
 class LoopExn(Exn): pass
@@ -52,7 +51,7 @@ class Event(object):
         :param tag: A string that can be used to further sub-classify events
         :param cause: The object that caused this event, optional.
         '''
-
+       
         if origin != None: TYPECHECK(origin, Emitter)
         self.__origin = origin
         self.__tag = None if tag == None else str(tag)
@@ -131,7 +130,8 @@ class Event(object):
 class Emitter(object):
     '''Base class for objects that can emit events.'''
 
-    def __init__(self):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         self.__event_observers = []
     #enddef
 
@@ -184,6 +184,9 @@ class Emitter(object):
     
 #endclass
 
+RELAY = enum.Enum("RELAY", ("CONTINUE", "STOP"))
+class _RelayStopExn(Exception): pass
+
 class _RelayAdjacentsProperty(property):
     def __init__(self, bearing, *args, **kwargs):
         TYPECHECK(bearing, Bearing)
@@ -201,41 +204,10 @@ class _RelayAdjacentsProperty(property):
     #enddef
 #endclass
 
-class RelayMeta(type):
-    def __new__(cls, name, bases, dct):       
-        #DBG("New Relay class being created: {!r}".format((cls, name, bases, dct)))
-        info = {}
-        # Add any info from base classes
-        for b in bases:
-            if type(b) == cls:
-                info.update(b._event_relay_info)
-            #endif
-        #endfor
-        # Search for adjacent properties, add to info dict, and replace with a
-        # regular property.
-        for (k, v) in list(dct.items()):
-            if isinstance(v, _RelayAdjacentsProperty):
-                DBG("Found _RelayAdjacentsProperty object: %r", v)
-                DBG("\tevent_bearing = %r", v._event_bearing)
-                bearing = v._event_bearing
-                TYPECHECK(bearing, Bearing)
-                new_v = property(fget=v.fget, fset=v.fset, fdel=v.fdel)
-                dct[k] = new_v
-                info[bearing] = new_v
-            #endif
-        #endfor
-        dct["_event_relay_info"] = info
-        return super(RelayMeta, cls).__new__(cls, name, bases, dct)
-    #enddef
-#endclass
+class Relay(Emitter):
 
-RELAY = enum.Enum("RELAY", ("CONTINUE", "STOP"))
-class _RelayStopExn(Exception): pass
-
-class Relay(Emitter, metaclass=RelayMeta):
-
-    def __init__(self):
-        super().__init__()
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         self.__relay_event_observers = []
     #enddef
 
@@ -275,11 +247,13 @@ class Relay(Emitter, metaclass=RelayMeta):
 
         info = self.__class__._event_relay_info
 
-        if not isinstance(self, bearing.Relay):
-            raise InvalidBearingExn(
-                "Relay {!r} is not on bearing {!r}".format(
-                    self, bearing))
-        #endif
+        # Note: No longer performing this check as it is generally not necessary.
+        # if not isinstance(self, bearing.Relay):
+        #     raise InvalidBearingExn(
+        #         "Relay {!r} is not on bearing {!r}".format(
+        #             self, bearing))
+        # #endif
+        
         if not bearing in info:
             raise InvalidRelayExn(
                 "Relay {!r} does not have an adjacents property for bearing {!r}".format(
@@ -299,10 +273,64 @@ class Relay(Emitter, metaclass=RelayMeta):
         #endfor
 
     #enddef
+
+    _event_relay_info = {}
     
     @classmethod
     def _event_bearings(cls):
         return list(cls._event_relay_info.keys())
+    #enddef
+
+    @classmethod
+    def register(cls, *bearings):
+        '''Decorator to create the _event_relay_info attribute for a subclass of
+        Relay.
+        If arguments are provided, these are taken to be the bearings that the
+        Relay must have declared adjacents properties for.
+
+        Note that subclasses that add or override adjacents properties need to
+        be wrapped by this decorator as well.
+        '''
+        def _decorator(incls):
+            info = {}
+            # Add any info from base classes
+            for b in incls.__bases__:
+                if issubclass(b, cls):
+                    info.update(b._event_relay_info)
+                #endif
+            #endfor
+            # Search for adjacent properties, add to info dict, and replace with a
+            # regular property.
+            for (k, v) in list(incls.__dict__.items()):
+                if isinstance(v, _RelayAdjacentsProperty):
+                    DBG("Found _RelayAdjacentsProperty object: %r", v)
+                    DBG("\tevent_bearing = %r", v._event_bearing)
+                    bearing = v._event_bearing
+                    TYPECHECK(bearing, Bearing)
+                    new_v = property(fget=v.fget, fset=v.fset, fdel=v.fdel)
+                    setattr(incls, k, new_v)
+                    info[bearing] = new_v
+                #endif
+            #endfor
+
+            if bearings != []:
+                # Check that we have all the adjacent properties required.
+                required = set(bearings)
+                have = set(info.keys())
+                missing = required - have
+                if len(missing) > 0:
+                    raise TypeError("Missing relay adjacent property for required bearings: {}".format(tuple(missing)))
+                #endif
+                extra = have - required
+                if len(extra) > 0:
+                    raise TypeError("Extra relay adjacent property for undeclared bearings: {}".format(tuple(extra)))
+                #endif
+            #endif
+            
+            incls._event_relay_info = info
+            return incls
+        #enddef
+        return _decorator
     #enddef
     
 #endclass
@@ -310,15 +338,6 @@ class Relay(Emitter, metaclass=RelayMeta):
 class Bearing(object):
     def __init__(self, name):
         self._name = name
-        class _Relay(Relay):
-            @self.adjacents_property
-            def __missing_adjacents(self):
-                raise TypeError("Relay adjacent property not defined for node.")
-            #enddef
-        #endclass
-        _Relay.__qualname__ = "{}_Relay".format(name)
-        _Relay.__name__ = _Relay.__qualname__
-        self.Relay = _Relay
     #enddef
     def __repr__(self): return "Bearing<{}>".format(self._name)
     
@@ -1012,7 +1031,71 @@ class EventTestCase(unittest.TestCase):
         #endtry
         self.fail(msg="Expected {!r} exception.".format(exntype))
     #enddef
-    
+
+    def assertEventsMatch(self, events, specs,
+                          includes_bearings=False,
+                          include_origin=False,
+                          ignore_props=()):
+        # specs should be a list of 'spec' objects, where a spec is of the
+        # form: (<event type>, <property list>),
+        # or ((<bearing>, <event type>), <property list>) if
+        # includes_bearings is True.
+        # <property list> is a list of 2-tuples (<name>, <value>) where
+        # <name> is the name of an event property, and <value> is the
+        # expected value of that property.
+        # Properties in ignore_props are ignored and not compared against the
+        # spec list.
+
+        # To perform the match, we sort the event list and the spec list.
+
+        def get_event_properties(ev):
+            props = [(k, v) for (k, v) in ev.__dict__.items()
+                     if not k.startswith("_") and not k in ignore_props]
+            if include_origin: props.append(("origin", ev.origin))
+            return props
+        #enddef
+
+        if includes_bearings:
+            def event_info(bev): return ((bev[0], type(bev[1])), get_event_properties(bev[1]))
+            def event_sort_key(bev):
+                ((bearing, evtype), props) = event_info(bev)
+                return (bearing, repr(evtype), repr(props))
+            #enddef
+            def spec_sort_key(spec):
+                ((bearing, event), props) = spec
+                return ((bearing, repr(event)), repr(props))
+            #enddef
+        else:
+            def event_info(ev): return (type(ev), get_event_properties(ev))
+            def event_sort_key(ev):
+                (evtype, props) = event_info(ev)
+                return (repr(evtype), repr(props))
+            #enddef
+            def spec_sort_key(spec):
+                (event, props) = spec
+                return (repr(event), repr(props))
+            #enddef
+        #endif
+
+        sorted_events = sorted(events, key=event_sort_key)
+        sorted_specs = sorted(specs, key=spec_sort_key)
+
+        if len(sorted_events) != len(sorted_specs):
+            self.fail("Event list does not match spec:\nEvents:\t{}\nSpecs:\t{}".format(
+                sorted_events, sorted_specs))
+        #endif
+                
+        for (i, ev) in enumerate(sorted_events):
+            (ev_type, ev_props) = event_info(ev)
+            (spec_type, spec_props) = sorted_specs[i]
+
+            self.assertEqual(ev_type, spec_type)
+            self.assertCountEqual(ev_props, spec_props)
+            
+        #endfor
+
+    #enddef
+   
 #endclass
 
 class Test(EventTestCase):
@@ -1317,7 +1400,8 @@ class Test(EventTestCase):
         #endclass
         
         BRG_CHILDREN = Bearing("Children")
-        class ChildrenRelay(SelfObserver, BRG_CHILDREN.Relay):
+        @Relay.register(BRG_CHILDREN)
+        class ChildrenRelay(SelfObserver, Relay):
             def __init__(self, name, children):
                 super().__init__()
                 self._name = name
@@ -1384,7 +1468,8 @@ class Test(EventTestCase):
 
         # Test singleton adjacents
         BRG_SECRET = Bearing("Secret")
-        class SecretRelay(SelfObserver, BRG_SECRET.Relay):
+        @Relay.register(BRG_SECRET)
+        class SecretRelay(SelfObserver, Relay):
             def __init__(self, name, neighbour):
                 super().__init__()
                 self._name = name
@@ -1421,7 +1506,8 @@ class Test(EventTestCase):
         
         # Test subclass with new bearing
         BRG_PARENT = Bearing("Parent")
-        class ExtendedRelay(ChildrenRelay, BRG_PARENT.Relay):
+        @Relay.register(BRG_CHILDREN, BRG_PARENT)
+        class ExtendedRelay(ChildrenRelay):
             def __init__(self, name, parent, children):
                 super().__init__(name, children)
                 self._parent = parent
@@ -1444,10 +1530,9 @@ class Test(EventTestCase):
              (foo_child, BRG_CHILDREN, ev))
         )
 
-        # Test multiple inheritance
-        class MultiRelay(SelfObserver,
-                         BRG_CHILDREN.Relay,
-                         BRG_PARENT.Relay):
+        # Test defining multiple bearings
+        @Relay.register(BRG_CHILDREN, BRG_PARENT)
+        class MultiRelay(SelfObserver, Relay):
             def __init__(self, name, parent, children):
                 super().__init__()
                 self._name = name
@@ -1479,42 +1564,41 @@ class Test(EventTestCase):
        
         bar._parent = secret_a
         manager.reset()
-        with self.safeAssertRaises(InvalidBearingExn):
+        with self.safeAssertRaises(InvalidRelayExn):
             DBG("FOOFOO sending event")
             ev = bar.emit_event(Test.BarEvent, "test")
             self.wait_for_events()
             DBG("FOOFOO completed wait")
         #endwith
 
-        class BadRelay(BRG_PARENT.Relay):
-            def __init__(self):
-                super().__init__()
-            #enddef
-        #endclass
-        bad = BadRelay()
-
-        manager.reset()
+        # Test for missing adjacents property in declaration.
         with self.safeAssertRaises(TypeError):
-            bad.emit_event(Test.FooEvent, "bad test")
-            self.wait_for_events()
+            @Relay.register(BRG_PARENT)
+            class BadRelay(Relay):
+                def __init__(self):
+                    super().__init__()
+                #enddef
+            #endclass
         #endwith
 
-        # Test with a handler registered.
-        manager.reset()
-        manager.register_handler(Test.FooEvent, lambda _: None)
-        with self.safeAssertRaises(TypeError):
-            bad.emit_event(Test.FooEvent, "bad test")
-            self.wait_for_events()
-        #endwith
-
-        # Test with an observer registered.
-        manager.reset()
-        bar.add_relay_event_observer(lambda _: None)
-        with self.safeAssertRaises(TypeError):
-            bad.emit_event(Test.FooEvent, "bad test")
-            self.wait_for_events()
-        #endwith
         
+        # Test for missing adjacents property in declaration.
+        with self.safeAssertRaises(TypeError):
+            @Relay.register(BRG_PARENT)
+            class BadRelay(Relay):
+                def __init__(self, name, parent, children):
+                    super().__init__()
+                    self._name = name
+                    self._parent = parent
+                    self._children = children
+                #enddef
+                @BRG_PARENT.adjacents_property
+                def parent(self): return self._parent
+                @BRG_CHILDREN.adjacents_property
+                def children(self): return self._children
+            #endclass
+        #endwith
+
         # XXX: Any more error conditions to test?
         
     #enddef    

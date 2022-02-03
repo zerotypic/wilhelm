@@ -4,6 +4,9 @@
 
 from .immutable import immdict
 
+# Base type for all lazy objects.
+class Lazy(object): pass
+
 class LazyMeta(type):
     '''Metaclass for lazy instantiation.
     
@@ -19,18 +22,27 @@ class LazyMeta(type):
 
     Note that if `__lazy_preinit__` is defined for a lazy class, then any
     subclass of that class whose `__init__` defines different arguments, must
-    similarly have a `__lazy_preinit__` accepting those arguments. Otherwise,
-    an exception might be thrown when the constructor arguments get passed to
-    the superclass's `__lazy_preinit__`.
+    similarly have a `__lazy_preinit__` capable of accepting those
+    arguments. Otherwise, an exception might be thrown when the constructor
+    arguments get passed to the superclass's `__lazy_preinit__`.
+
     '''
 
     def __init__(realcls, name, bases, dct):
         super().__init__(name, bases, dct)
        
-        # We mint a new lazy class for each class of this metaclass.
-        # XXX: Document!
-        class _Lazy(object):
+        # We mint a new lazy class for each class of this metaclass, so lazy
+        # instances of different target classes have different types.
+        class _Lazy(Lazy):
 
+            # The magic happens here. When a new instance of the target class
+            # is being created, we first call __new__() on the target class to
+            # allocate space for that instance. We then call
+            # `__lazy_preinit__()` if it exists. Finally, we change the class
+            # of the instance to `_Lazy` by directly modifying the `__class__`
+            # attribtue. This will prevent the target class's `__init__` from
+            # actually running, leaving the instance in a kind of
+            # half-initialized state.
             def __new__(cls, args, kwargs):
                 # Use the real class's __new__ to get a new object instance.
                 obj = realcls.__new__(realcls, *args, **kwargs)
@@ -45,18 +57,26 @@ class LazyMeta(type):
                 return obj
             #enddef
 
+            # Here, we complete initialization by changing the instance's
+            # class back to the target class, and then calling
+            # `__init__()`. The instance is now fully initialized and behaves
+            # normally.
             def __reify__(self):
                 (args, kwargs) = self.__lazy_info
                 del self.__dict__["_Lazy__lazy_info"]
                 super().__setattr__("__class__", realcls)
                 self.__init__(*args, **kwargs)
             #enddef
-        
+
+            # We hook onto `__getattr__()` so attempts to access attributes
+            # not part of the lazy instance (which would have been set in
+            # `__lazy_preinit__()`) results in reification.
             def __getattr__(self, name):
                 self.__reify__()
                 return getattr(self, name)
             #enddef
 
+            # Same as above.
             def __setattr__(self, name, value):
                 self.__reify__()
                 setattr(self, name, value)
@@ -64,7 +84,7 @@ class LazyMeta(type):
     
             def __repr__(self):
                 (args, kwargs) = self.__lazy_info
-                return "Lazy{}{}".format(realcls.__qualname__, (args, kwargs))
+                return "{}_Lazy{}".format(realcls.__qualname__, (args, kwargs))
             #enddef
 
         #endclass
@@ -102,14 +122,17 @@ class LazyFactoryMeta(LazyMeta):
     an object matches an object already in the cache, the cache object is
     returned.
 
-    The cache is keyed via a special class method `_lazy_factory_get_key`,
-    which is provided the arguments and keyword arguments that would be passed
-    to `__init__`. If this method does not exist, then the `repr` of the first
-    argument is used as the key. If no arguments are provided, then the key is
-    set to `None`.
+    The cache is keyed via a special class method on the target class,
+    `_lazy_factory_get_key()`, which is provided the arguments and keyword
+    arguments that would be passed to `__init__`. If this method does not
+    exist, then the `repr` of the first argument is used as the key. If no
+    arguments are provided, then the key is set to `None`.
 
-    XXX: Document _lazy_factory_get_key in more detail.
-    XXX: Document _lazy_factory_purge_key
+    Two helper class methods are also added to the target class,
+    `_lazy_factory_get_cache()` and
+    `_lazy_factory_purge_key()`. `_lazy_factory_get_cache()`returns the
+    factory's cache, and`_lazy_factory_purge_key()` allows a specific key from
+    the cache to be removed.
     '''
     
     def __init__(cls, name, bases, dct):
@@ -141,3 +164,5 @@ class LazyFactoryMeta(LazyMeta):
     #enddef
     
 #endclass
+
+def is_lazy(obj): return isinstance(obj, Lazy)

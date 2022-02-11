@@ -260,7 +260,7 @@ class Relay(Emitter):
                     self, bearing))
         #endif
 
-        adjacents = info[bearing].fget(self)
+        adjacents = getattr(self, info[bearing])
         if isinstance(adjacents, Relay):
             # Singleton adjacent
             adjacents = [adjacents]
@@ -299,6 +299,10 @@ class Relay(Emitter):
                     info.update(b._event_relay_info)
                 #endif
             #endfor
+
+            # Note down inherited bearings.
+            inherited_bearings = set(info.keys())
+            
             # Search for adjacent properties, add to info dict, and replace with a
             # regular property.
             for (k, v) in list(incls.__dict__.items()):
@@ -309,7 +313,7 @@ class Relay(Emitter):
                     TYPECHECK(bearing, Bearing)
                     new_v = property(fget=v.fget, fset=v.fset, fdel=v.fdel)
                     setattr(incls, k, new_v)
-                    info[bearing] = new_v
+                    info[bearing] = k
                 #endif
             #endfor
 
@@ -321,7 +325,7 @@ class Relay(Emitter):
                 if len(missing) > 0:
                     raise TypeError("Missing relay adjacent property for required bearings: {}".format(tuple(missing)))
                 #endif
-                extra = have - required
+                extra = have - required - inherited_bearings
                 if len(extra) > 0:
                     raise TypeError("Extra relay adjacent property for undeclared bearings: {}".format(tuple(extra)))
                 #endif
@@ -1503,10 +1507,35 @@ class Test(EventTestCase):
         )
 
         # XXX: Test adjacents deleters?
+
+        # Test subclass with overriden adjacents property
+        class NewChildrenRelay(ChildrenRelay):
+            def __init__(self, name, children, extra_child):
+                super().__init__(name, children)
+                self._extra_child = extra_child
+            #enddef
+            @property
+            def children(self):
+                return list(self._children) + \
+                    [self._extra_child] if self._extra_child != None else []
+            #enddef
+        #endclass
+        foo = NewChildrenRelay("foo", [], None)
+        bar = NewChildrenRelay("bar", [], None)
+        foo_parent = NewChildrenRelay("foo_parent", [foo], bar)
         
+        foo.add_relay_event_observer(foo.observer)
+        bar.add_relay_event_observer(bar.observer)
+        ev = Test.FooEvent("test", origin=foo_parent)
+        assertRelayedEvents(
+            ev,
+            ((foo, BRG_CHILDREN, ev),
+             (bar, BRG_CHILDREN, ev))
+        )
+                    
         # Test subclass with new bearing
         BRG_PARENT = Bearing("Parent")
-        @Relay.register(BRG_CHILDREN, BRG_PARENT)
+        @Relay.register(BRG_PARENT)
         class ExtendedRelay(ChildrenRelay):
             def __init__(self, name, parent, children):
                 super().__init__(name, children)
@@ -1580,7 +1609,6 @@ class Test(EventTestCase):
                 #enddef
             #endclass
         #endwith
-
         
         # Test for missing adjacents property in declaration.
         with self.safeAssertRaises(TypeError):

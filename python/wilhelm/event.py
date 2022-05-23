@@ -288,8 +288,9 @@ class Relay(Emitter):
         If arguments are provided, these are taken to be the bearings that the
         Relay must have declared adjacents properties for.
 
-        Note that subclasses that add or override adjacents properties need to
-        be wrapped by this decorator as well.
+        Note that subclasses that add adjacents properties need to be wrapped
+        by this decorator as well.
+
         '''
         def _decorator(incls):
             info = {}
@@ -673,21 +674,24 @@ class EventManager(object):
             for obv in obvs:
                 try:
                     r = await self._run_or_await(obv, brg, ev)
+                    if r == RELAY.STOP:
+                        DBG("Relay observer %r along bearing %r requested to stop relaying event %r",
+                            obv, brg, ev)
+                        break
+                    #endif
                 except Exception as exn:
                     exns.append((obv, exn))
                 #endtry
-                if r == RELAY.STOP:
-                    DBG("Relay observer %r along bearing %r requested to stop relaying event %r",
-                        obv, brg, ev)
-                    break
-                #endif
             #endfor
         #endfor
         DBG("Finished calling all relay observers.")
 
         if LOG.isEnabledFor(logging.WARNING) and exns != []:
             DWARN("Observers raised exceptions for event %r:", ev)
-            for exn in exns: DWARN("\t%r", exn)
+            for (obv, exn) in exns:
+                DWARN("\tObserver {!r}".format(obv))
+                util.log_exn(DWARN, exn, tabs=2)
+            #endfor
         #endif
         
         ev.mark_observed(exns=exns)

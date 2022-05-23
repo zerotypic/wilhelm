@@ -5,6 +5,7 @@
 import itertools
 import re
 import asyncio
+import random
 
 from . import event
 from . import util
@@ -15,11 +16,10 @@ from .util import asyncutils
 class Exn(Exception): pass
 class InvalidBasenameExn(Exn): pass
 class DuplicateNameExn(Exn): pass
-class SQNameConflictExn(Exn): pass
-class SQNameChildExn(Exn): pass
 class NotFoundExn(Exn): pass
 class SearchExn(Exn): pass
 class OrphanedExn(Exn): pass
+class InvalidChildClassExn(Exn): pass
 
 __all__ = ("Root", "QName", "Context")
 
@@ -27,6 +27,8 @@ __all__ = ("Root", "QName", "Context")
 
 _DELIMITER = "::"
 _SUFFIX_DELIMITER = "$$"
+
+AUTO_NAME_BASE_PREFIX = "wauto_"
 
 # XXX: TODO Optimize and make more memory-efficient.
 
@@ -87,6 +89,11 @@ class RenameEvent(QNameEvent):
         self.old_name = old_name
         self.new_name = new_name
     #enddef
+
+    def get_old_fullname(self):
+        return self.qname.parent._join(self.old_name)
+    #enddef
+    
 #endclass
 
 class ChildMoveEvent(QNameEvent):
@@ -101,13 +108,19 @@ class ChildMoveEvent(QNameEvent):
         self.old_name = old_name
         self.new_name = new_name
     #enddef
+
+    def get_old_fullname(self):
+        return self.old_parent._join(self.old_name)
+    #enddef
+    
 #endclass
 
 class EntityChangeEvent(QNameEvent):
     '''Triggered whenever a qname's entity is set.'''
-    def __init__(self, ctx, qname, **kwargs):
+    def __init__(self, ctx, qname, old_entity, **kwargs):
         super().__init__(ctx, **kwargs)
         self.qname = qname
+        self.old_entity = old_entity
     #enddef
 #endclass
 
@@ -145,23 +158,25 @@ class Root(event.Relay):
     def __contains__(self, item): return item in self._children
     
     def descendents(self):
-        '''Returns all descendents, including self.'''
-        yield self
+        '''Returns all descendent QNames, including self, if self is a QName.'''
+        if isinstance(self, QName): yield self
         for c in self._children.values():
             for d in c.descendents(): yield d
         #endfor
     #enddef
 
+    def filter_descendents(self, filt):
+        return (d for d in self.descendents() if filt(d))
+    #enddef
+    
     def terminals(self, filter_entity_type=None):
         '''Returns all terminal descendents.'''
-        for c in self.descendents():
-            if not issubclass(type(c), QName): continue
-            if not c.is_terminal: continue
-            if filter_entity_type != None:
-                if not issubclass(type(c.entity), filter_entity_type): continue
-            #endif
-            yield c
-        #endfor
+        if filter_entity_type != None:
+            filt = lambda qn: qn.is_terminal and isinstance(qn.entity, filter_entity_type)
+        else:
+            filt = lambda qn: qn.is_terminal
+        #endif
+        return self.filter_descendents(filt)
     #enddef
 
     def _check_duplicate_name(self, name):
@@ -178,10 +193,21 @@ class Root(event.Relay):
         del self._children[child._basename]
     #enddef
     
-    def add_child(self, child_basename, caused_by=None):
+    def add_child(self, child_basename, child_cls=None, caused_by=None):
         '''Creates and returns a new child to this namespace with basename 'child_basename'.'''
         self._check_duplicate_name(child_basename)
-        new_child = QName(self._ctx, self, child_basename)
+
+        if child_cls == None:
+            if type(self) == Root:
+                child_cls = QName
+            else:
+                child_cls = type(self)
+            #endif
+        elif not issubclass(child_cls, QName):
+            raise InvalidChildClassExn("Requested child class {!r} is not a subclass of QName.".format(child_cls))
+        #endif
+        
+        new_child = child_cls(self._ctx, self, child_basename)
         self._add_child(new_child)
         self.emit_event(AddChildEvent, self._ctx, self, child_basename, cause=caused_by)
         return new_child           
@@ -296,10 +322,21 @@ class Root(event.Relay):
         return list(itertools.chain(*(child.search(query, **kwargs) for child in self._children.values())))
     #enddef
 
+    def auto_child(self, prefix="", child_cls=None):
+        '''Creates a new child with an automatically generated name.'''
+        while True:
+            child_basename = prefix + AUTO_NAME_BASE_PREFIX + util.random_name(10)
+            if not child_basename in self.children: break
+        #endwhile
+
+        return self.add_child(child_basename, child_cls=child_cls)
+    #enddef
+    
 #endclass
 
 @event.Relay.register(BRG_PARENT, BRG_CHILDREN)
 class QName(Root):
+
     '''
     A qualified name (QName) is a name within a namespace. It consists of
     an identifier (basename), and a parent QName. Given a QName, its child
@@ -323,7 +360,7 @@ class QName(Root):
         
         TYPECHECK(parent, Root)
 
-        super(QName, self).__init__(ctx)
+        super().__init__(ctx)
         self._parent = parent
         self._basename = basename
         self._entity = entity
@@ -379,14 +416,15 @@ class QName(Root):
     def set_parent(self, new_parent, caused_by=None):
         TYPECHECK(new_parent, Root)
         if new_parent._ctx != self._ctx:
-            print("WARNING: Changing to a parent with a different context!")
+            DWARN("WARNING: Changing to a parent with a different context!")
         #endif
         new_parent._adopt_child(self, caused_by=caused_by)
     #enddef  
 
     def set_entity(self, entity, caused_by=None):
+        old_entity = self._entity
         self._entity = entity
-        self.emit_event(EntityChangeEvent, self._ctx, self, cause=caused_by)
+        self.emit_event(EntityChangeEvent, self._ctx, self, old_entity, cause=caused_by)
     #enddef
     
     _search_re = re.compile("^(::|:\*:)?(.*?)((::|:\*:).*)?$")
@@ -465,12 +503,16 @@ class Context(object):
     A naming context.
     '''
     
-    def __init__(self, name):
+    def __init__(self, name, qncls=QName):
         '''Creates a new naming context. <name> is used to identify the context.'''
         self._name = name
         self._root = Root(self)
         self._is_clean_event = asyncio.Event()
         self._is_clean_event.set()
+        if not issubclass(qncls, QName):
+            raise InvalidChildClassExn("Requested context child class {!r} is not a subclass of QName.".format(qncls))
+        #endif
+        self._qncls = qncls
     #enddef
 
     def __repr__(self): return "Context<%s>" % self.name
@@ -488,6 +530,12 @@ class Context(object):
     def terminals(self, filter_entity_type=None):
         return self._root.terminals(filter_entity_type=filter_entity_type)
     #enddef
+
+    # Can be overriden by subclasses if some additional logic is necessary.
+    def _add_child_to_qname(self, parent, child_basename, caused_by=None):
+        return parent.add_child(child_basename, child_cls=self._qncls, caused_by=caused_by)
+    #enddef
+
     #
     # Internal function used to implement locate and build.
     # Notes:
@@ -504,7 +552,7 @@ class Context(object):
         for match_name in namelist[:-1]:
             if not match_name in cur.children:
                 if build:
-                    cur = cur.add_child(match_name, caused_by=caused_by)
+                    cur = self._add_child_to_qname(cur, match_name, caused_by=caused_by)
                 else:
                     return None
                 #endif
@@ -523,7 +571,7 @@ class Context(object):
             if term_name in cur.children:
                 return cur.children[term_name]
             elif build:
-                return cur.add_child(term_name, caused_by=caused_by)
+                return self._add_child_to_qname(cur, term_name, caused_by=caused_by)
             else:
                 return None
             #endif
@@ -541,10 +589,16 @@ class Context(object):
         return qn
     #enddef
     
-    def contains(self, qns):
-        qn = self._locate(qns)
-        return qn != None
+    def contains(self, query):
+        if  isinstance(query, Root):
+            return query._ctx == self
+        else:
+            qn = self._locate(str(query))
+            return qn != None
+        #endif
     #enddef
+
+    def __contains__(self, item): return self.contains(item)
     
     def build(self, qns, caused_by=None):
         return self._locate(qns, build=True, caused_by=caused_by)
@@ -596,12 +650,21 @@ class Context(object):
 
     #enddef
 
+    def auto_name(self, prefix=""): return self._root.auto_child(prefix=prefix)
+    
     def __getitem__(self, key):
         v = self._locate(key, build=False)
         if v == None: raise KeyError(key)
         return v
     #enddef
     def __iter__(self): return iter(self.terminals())
+
+    @staticmethod
+    def is_auto_name(n, prefix=""):
+        return n.startswith(prefix + AUTO_NAME_BASE_PREFIX) \
+            and len(n) == len(prefix + AUTO_NAME_BASE_PREFIX) + 10
+    #enddef
+
     
 #endclass
 
@@ -716,8 +779,7 @@ class Test(event.EventTestCase):
 
         self.assertCountEqual(
             list(ctx.root.descendents()),
-            [ctx.root,
-             foo, foo_ding, foo_gah,
+            [foo, foo_ding, foo_gah,
              bar, bar_ding, bar_ding_dong, bar_boing]
         )
 
@@ -1272,5 +1334,7 @@ class Test(event.EventTestCase):
 
     # XXX: TODO: Add tests for setting caused_by values in emitted events.
     # XXX: TODO: Add tests for is_clean event.
+    # XXX: TODO: Add tests for auto_child, auto_name.
+    # XXX: TODO: Add tests for custom child class in Root.add_child().
     
 #endclass

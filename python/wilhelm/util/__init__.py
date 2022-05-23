@@ -3,6 +3,8 @@
 #
 
 import logging
+import random
+import traceback
 import idaapi
 
 class Exn(Exception): pass
@@ -70,4 +72,59 @@ def setup_logger(name):
     '''
     log = logging.getLogger(name)
     return (log, log.critical, log.error, log.warning, log.info, log.debug)
+#enddef
+
+def log_exn(printer, exn, tabs=0):
+    printer("\t"*tabs + "="*20)
+    for l in "".join(traceback.format_exception(exn, exn, exn.__traceback__)).splitlines():
+        printer("\t"*tabs + l)
+    #endfor
+    printer("\t"*tabs + "="*20)
+#enddef
+
+class UninitializedValue(object):
+    '''Descriptor that raises an exception if it is accessed.
+
+    Can be used for value which must be initialized before being
+    accessed. Initialization would entail replacing an instance of this
+    class with the actual value.'''
+    def __init__(self, exn, *args, **kwargs):
+        self._exn = exn
+        self._args = args
+        self._kwargs = kwargs
+    #enddef
+
+    def __get__(self, obj, owner=None):
+        raise self._exn(*self._args, **self._kwargs)
+    #enddef
+#endclass
+
+def random_name(length):
+    '''Generates a random name suitable for use as an identifier.'''
+    return "".join(
+        [random.choice("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789")
+         for _ in range(0,length)])
+#enddef
+
+def get_all_subclasses(cls):
+    acc = []
+    def _get_all(cls):
+        acc.append(cls)
+        for c in cls.__subclasses__(): _get_all(c)
+    #enddef
+    _get_all(cls)
+    return acc[1:]
+#enddef
+
+def rename_ida_type_by_ordinal(ordinal, new_name):
+    lt = idaapi.get_std_dirtree(idaapi.DIRTREE_LOCAL_TYPES)
+    oldpath = lt.get_abspath(lt.find_entry(idaapi.direntry_t(ordinal)))
+    lt.rename(oldpath, new_name)
+#enddef
+
+def rename_ida_type(old_name, new_name):
+    ti = idaapi.tinfo_t()
+    ti.get_named_type(idaapi.cvar.idati, old_name)
+    ordinal = ti.get_ordinal()
+    return rename_ida_type_by_ordinal(ordinal, new_name)
 #enddef

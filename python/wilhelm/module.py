@@ -12,9 +12,12 @@ from . import qname
 from . import event
 from . import ida_events
 from . import util
+from . import storage
+from . import types
 from .util import asyncutils
 from .util import lazy
 from .util import TYPECHECK
+from .util.immutable import immdict
 
 (LOG, DCRIT, DERROR, DWARN, DINFO, DBG) = util.setup_logger(__name__)
 
@@ -29,6 +32,10 @@ class Exn(Exception): pass
 class ExistingNameExn(Exn): pass
 class NotTerminalExn(Exn): pass
 class HasSuffixesExn(Exn): pass
+
+class UnsupportedArchitectureExn(Exn): pass
+
+class InvalidStorageClassExn(Exn): pass
 
 # An item is an object that can be found inside a module.
 # Items are designed to be lazy by default, holding only their address. To
@@ -225,10 +232,43 @@ class Module(event.Emitter):
     def __init__(self):
         super().__init__()
         self._value_ctx = ValueContext(self)
-        self._type_ctx = qname.Context("type")
+        # XXX: Need to find the right way to get this set without circular
+        # dependencies.
+        # --> Currently circumventing things by having _type_ctx be set by
+        # init_current_module().
+        #self._type_ctx = qname.Context("types") # types.TypeContext(self)
         self._ready_event = asyncio.Event()
+        self._init_info()
     #enddef
 
+    def _init_info(self):
+        # Initialize module-specific information.
+        info = {}
+
+        ida_info = idaapi.get_inf_structure()
+        ptrsize_flag = ida_info.cc.cm & idaapi.CM_MASK
+        if ptrsize_flag == idaapi.CM_N32_F48:
+            # 32-bit
+            info["addr_size"] = 4
+        elif ptrsize_flag == idaapi.CM_N64 and ida_info.cc.size_i > 2:
+            # 64-bit
+            info["addr_size"] = 8
+        else:
+            # We don't support anything else.
+            raise UnsupportedArchitectureExn()
+        #endif
+
+        abibits = ida_info.abibits
+        info["8align4"] = abibits & idaapi.ABI_8ALIGN4 != 0
+        info["bigarg_align"] = abibits & idaapi.ABI_BIGARG_ALIGN != 0
+        
+        self.info = immdict(info)
+
+        self._storages = {}
+        
+    #enddef
+
+    # XXX: This is unsused now?
     def init_handlers(self):
         self._value_ctx.root.clear_relay_event_observers()
         self._value_ctx.root.add_relay_event_observer(self._observe_value_events)
@@ -248,6 +288,19 @@ class Module(event.Emitter):
     @property
     def types(self): return self._type_ctx
 
+    def get_storage(self, name, storage_class=storage.Storage):
+        if not name in self._storages:
+            if not issubclass(storage_class, storage.Storage):
+                raise InvalidStorageClassExn("Specified class {!r} is not a subclass of storage.Storage.".format(storage_class))
+            #endif
+            self._storages[name] = storage_class(name)
+        else:
+            if not isinstance(self._storages[name], storage_class):
+                raise InvalidStorageClassExn("Instantiated storage has class {!r}, incompatible with requested class {!r}.".format(type(self._storages[name]), storage_class))
+        #endif
+        return self._storages[name]
+    #enddef
+    
     def get_qname_for_addr(self, addr):
         return self._get_qname_for_ida_name(idaapi.get_name(addr))
     #enddef
@@ -446,12 +499,13 @@ class Module(event.Emitter):
     
 #endclass
 
-_CURRENT_MODULE = None
+_CURRENT_MODULE = Module()
 def current(): return _CURRENT_MODULE
 
 async def init_current_module():
-    mod = Module()
-    sys.modules[__name__]._CURRENT_MODULE = mod
+    #mod = Module()
+    #sys.modules[__name__]._CURRENT_MODULE = mod
+    mod = current()
     DINFO("Populating values....")
     event.manager._set_global_disable(True)
     await mod._populate_values()
@@ -471,6 +525,12 @@ async def init_current_module():
         tag=mod.type_context.name,
         priority=-99)
     DINFO("Done.")
+
+    DINFO("Setting up type context for this module...")
+    mod._type_ctx = types.TypeContext(mod)
+    mod._type_ctx.sync()
+    DINFO("Done.")
+
     await mod._set_ready()
     return mod
 #enddef

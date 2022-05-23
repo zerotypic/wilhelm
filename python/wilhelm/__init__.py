@@ -12,13 +12,16 @@ from . import util
 class Feature(Enum):
     EVENT = ("event", "ida_events")
     QNAME = ("qname",)
+    MODULE = ("storage", "module",)
+    TYPES = ("types",)
     AST = ("ast",)
     PATH = ("path",)
-    MODULE = ("module",)
 #endclass
 
 CORE_FEATURES = (Feature.EVENT,
                  Feature.QNAME,
+                 Feature.MODULE,
+                 Feature.TYPES,
                  Feature.AST)
 
 

@@ -881,7 +881,7 @@ class Function(module.Item, event.Relay):
         elif hx.op == idaapi.cot_neg: # -x
             result = UnaOpExpr(G(hx.x), op=OP.NEG, **kwargs)
         elif hx.op == idaapi.cot_cast: # (type)x
-            result = CastExpr(G(hx.x), WilType(hx.type), **kwargs)
+            result = CastExpr(G(hx.x), WilType.from_tinfo(hx.type), **kwargs)
         elif hx.op == idaapi.cot_lnot: # !x
             result = UnaOpExpr(G(hx.x), op=OP.LNOT, **kwargs)
         elif hx.op == idaapi.cot_bnot: # ~x
@@ -937,7 +937,9 @@ class Function(module.Item, event.Relay):
             # memory. Detect such cases and convert to StrExpr.
             if idaapi.is_strlit(idaapi.get_flags(hx.obj_ea)):
                 strtype = idaapi.get_str_type(hx.obj_ea)
-                val = idaapi.get_strlit_contents(hx.obj_ea, -1, strtype)
+                # Calculate string length ignoring heads
+                strlen = idaapi.get_max_strlit_length(hx.obj_ea, strtype, idaapi.ALOPT_IGNHEADS)
+                val = idaapi.get_strlit_contents(hx.obj_ea, strlen, strtype)
                 result = StrExpr(val, **kwargs)
             else:
                 # XXX: Need to determine the type of the object at the
@@ -1292,7 +1294,7 @@ _hxop_map = {
 ###############################################
 
 async def _module_init(mod):
-    print("Initializing AST module.")
+    DINFO("Initializing AST module.")
     event.manager._register_handler(ida_events.HexRaysLocalRenameEvent,
                                     Function._handle_ida_local_rename,
                                     priority=-99)

@@ -511,6 +511,12 @@ async def init_current_module():
     await mod._populate_values()
     event.manager._set_global_disable(False)
     DINFO("Done.")
+
+    DINFO("Setting up type context for this module...")
+    mod._type_ctx = types.TypeContext(mod)
+    mod._type_ctx.sync()
+    DINFO("Done.")
+    
     # await event.manager.wait_till_queue_empty()
     DINFO("Ready to register event handlers, registering...")
     event.manager._register_handler(ida_events.RenameEvent, mod._handle_ida_rename, priority=-99)
@@ -524,11 +530,6 @@ async def init_current_module():
         mod._handle_type_events,
         tag=mod.type_context.name,
         priority=-99)
-    DINFO("Done.")
-
-    DINFO("Setting up type context for this module...")
-    mod._type_ctx = types.TypeContext(mod)
-    mod._type_ctx.sync()
     DINFO("Done.")
 
     await mod._set_ready()

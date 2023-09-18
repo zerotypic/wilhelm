@@ -17,6 +17,7 @@ from . import storage
 from . import util
 from .util import TYPECHECK, TypecheckExn, UninitializedValue
 from .util import asyncutils
+from .util import lazy
 
 (LOG, DCRIT, DERROR, DWARN, DINFO, DBG) = util.setup_logger(__name__)
 
@@ -33,13 +34,20 @@ class InvalidCallingConventionExn(FunctionExn): pass
 class InvalidSpoilInfoExn(FunctionExn): pass
 class InvalidStoreInfoExn(FunctionExn): pass
 
-class NamedTypeExn(Exn): pass
-class NameConflictExn(NamedTypeExn): pass
-class SuppInfoExn(NamedTypeExn): pass
+class NamedRefExn(Exn): pass
+class UnknownTypeNameExn(NamedRefExn): pass
 
 class UDTExn(Exn): pass
 class InvalidUDTSpecExn(UDTExn): pass
 class InvalidUDTSizeExn(UDTExn): pass
+
+class StructExn(Exn): pass
+class InvalidFieldsExn(StructExn): pass
+class InvalidFieldNameExn(StructExn): pass
+class InvalidFieldSpecExn(StructExn): pass
+class InvalidSizeExn(StructExn): pass
+class InvalidOffsetExn(StructExn): pass
+class CannotPreserveSizeExn(StructExn): pass
 
 class PolyTInfoExn(Exn): pass
 class PolyTypeSizeExn(Exn): pass
@@ -145,6 +153,14 @@ class WilType(event.Relay):
         # XXX: Implement!
         return self
     #enddef
+
+    # Ensure any NamedRef children have had their forward reference resolved.
+    def ensure_resolve_forward_refs(self):
+        if isinstance(self, NamedRef):
+            self.resolve_forward_ref()
+        #endif
+        for ty in self.components: ty.ensure_resolve_forward_refs()
+    #enddef
     
     @property
     def bytesize(self): raise UnimplementedExn()
@@ -194,17 +210,18 @@ class WilType(event.Relay):
         self._subtype_set.remove(subty)
     #enddef
 
-   
     #
     # Serialization
     #
 
     def _build_properties_json(self):
         '''This is a special method that gets called to build the properties JSON
-        object for serialization. Note that it does not actually override the
-        superclass's implementation, as WilType._to_properties_json() will
-        actually call the implementation of every class in the object's class
-        hierarchy to construct the properties object.
+        object for serialization. Note that subclass implementations do not
+        actually override the superclass's implementation, as
+        WilType._to_properties_json() will actually call the implementation of
+        every class in the object's class hierarchy to construct the
+        properties object.
+
         '''
         return {}
     #enddef
@@ -298,6 +315,14 @@ class WilType(event.Relay):
     #     return WilType()
     # #enddef
 
+    #
+    # _build_from_tinfo
+    # 
+    # :param ignore_toplevel_ref: Do not build a NamedRef for the top-level
+    #                             tinfo if it has a type name. This is useful
+    #                             when trying to build the contents of a type
+    #                             that has an assigned name.
+    #
     @classmethod
     def _build_from_tinfo(cls, tinfo,
                           search=None,
@@ -305,8 +330,11 @@ class WilType(event.Relay):
                           ignore_toplevel_ref=False,
                           use_forward_refs=False,
                           **kwargs):
+
         kwargs["make_refs"] = make_refs
         kwargs["use_forward_refs"] = use_forward_refs
+        # Note: ignore_toplevel_ref is not passed to recursive call.
+        
         # print("_build_from_tinfo: kwargs = {!r}".format(kwargs))
         if search != None:
             for subcls in util.get_all_subclasses(cls):
@@ -416,6 +444,12 @@ class Primitive(WilType):
         #endif
         return getattr(sys.modules[__name__], name)
     #enddef
+
+    @classmethod
+    def get_by_name(cls, name):
+        thismod = sys.modules[__name__]
+        return getattr(thismod, name)
+    #enddef
     
 #endclass
 
@@ -492,6 +526,7 @@ class Function(WilType):
     class CC(enum.Enum):
         '''Function calling convention.'''
         CDECL = idaapi.CM_CC_CDECL
+        ELLIPSIS = idaapi.CM_CC_ELLIPSIS
         STDCALL = idaapi.CM_CC_STDCALL
         PASCAL = idaapi.CM_CC_PASCAL
         FASTCALL = idaapi.CM_CC_FASTCALL
@@ -561,8 +596,8 @@ class Function(WilType):
     def args(self): return self._args
 
     @property
-    def ret_ty(self): return self._retty
-
+    def ret_ty(self): return self._ret_ty
+   
     @property
     def components(self):
         return tuple(set((ty for (_, ty) in self._args)).union((self._ret_ty,)))
@@ -625,7 +660,7 @@ class Function(WilType):
         if self._spoilinfo != None:
             for regname in self._spoilinfo:
                 reginfo = func_data.spoiled.push_back()
-                if not idaapi.parse_reg_name(regname, reginfo):
+                if not idaapi.parse_reg_name(reginfo, regname):
                     raise InvalidSpoilInfoExn(regname)
                 #endif
             #endfor
@@ -661,7 +696,7 @@ class Function(WilType):
         
         ret_ty = WilType.from_tinfo(func_data.rettype, **kwargs)
 
-        cc = cls.CC(func_data.cc)
+        cc = cls.CC(func_data.cc & idaapi.CM_CC_MASK)
 
         if cc in (cls.CC.USERCALL, cls.CC.USERPURGE):
             # Custom calling convention, need to manually set storeinfo.
@@ -726,7 +761,9 @@ class Function(WilType):
     def _from_properties_json(cls, obj):
         if obj["storeinfo"] != None:
             (args_store_j, ret_store_j) = obj["storeinfo"]
-            (loc_spec_j, loc_value_j) = args_store_j
+            # XXX: The below doesn't seem to do anything, so commented it
+            # out. Might have been old code that I forgot to remove.            
+            # (loc_spec_j, loc_value_j) = args_store_j
             args_store = [(n, (LOC(l[0]), l[1]))
                           for (n, l) in args_store_j]
             storeinfo = (args_store, ret_store_j)
@@ -816,14 +853,21 @@ class NamedRef(WilType):
     #enddef
 
     def _setup_tyname(self, tyname_str):
-        self._tyname = module.current().types[tyname_str]
+        try:
+            self._tyname = module.current().types[tyname_str]
+        except KeyError:
+            raise UnknownTypeNameExn("No type with name '{}' exists in the context.".format(tyname_str))
+        #endtry
+
         # We depend on the invariant that if a qname is part of the typename
         # context, then an idaname matching that qname already exists.
         self._tyname.add_event_observer(self._tyname_observer)
     #enddef
 
+    def is_forward_ref(self): return hasattr(self, "_forward_name")
+    
     def resolve_forward_ref(self):
-        if hasattr(self, "_forward_name"):
+        if self.is_forward_ref():
             self._setup_tyname(self._forward_name)
             del self._forward_name
         #endif
@@ -867,6 +911,7 @@ class NamedRef(WilType):
     #enddef
 
     def _build_properties_json(self):
+        self.resolve_forward_ref()
         return {"n" : self._tyname.fullname}
     #enddef
 
@@ -889,11 +934,13 @@ class ExtendedType(WilType):
     
     def __init__(self,
                  typename=None,
-                 transient=False,
+                 transient=True,
                  **kwargs):
 
         super().__init__(**kwargs)
 
+        # This needs to stay True, even if the transient argument is set,
+        # until the type has been fully persisted.
         self._is_transient = True
 
         if not transient:
@@ -904,20 +951,20 @@ class ExtendedType(WilType):
 
     def make_persistent(self, idaname=None, **kwargs):
         # Add to context.
-        print("Called make_persistent.")
+        DBG("Called make_persistent on {!r}:".format(self))
         if module.current().types.contains(idaname):
-            print("Updating existing type name.")
+            DBG("\tUpdating existing type name.")
             module.current().types.update(idaname, self)
         else:
-            print("Adding a new type name.")
-            module.current().types.add(self, qns=idaname)
+            DBG("\tAdding a new type name.")
+            module.current().types.add(idaname, self)
         #endif
     #enddef
 
     # This function gets called by the type context when it has added the type
     # to the context, thus making it persistent.
     def _mark_as_persistent(self, ordinal, idaname):
-        print("Called _mark_as_persistent.")
+        DBG("Marking type {!r} as persistent, ordinal={:d}, idaname={}".format(self, ordinal, idaname))
         self._type_ordinal = ordinal
         self._idaname = idaname
         self._is_transient = False
@@ -927,7 +974,7 @@ class ExtendedType(WilType):
     # persistent type gets removed from the context, usually because it was
     # replaced by another type.
     def _mark_as_transient(self):
-        print("Called _mark_as_transient.")
+        DBG("Marking type {!r} as transient.".format(self))
         del self._type_ordinal
         del self._idaname
         self._is_transient = True
@@ -1064,10 +1111,6 @@ class UDTBackedType(ExtendedType):
     '''
 
     def __init__(self, **kwargs):
-        '''Subclasses should call __init__() only when calling `_build_base_tinfo()`
-        will return a tinfo object and the size of the type.
-        '''
-        
         # if self.is_mono:
         #     (self._base_tinfo, self._bytesize) = self._build_base_tinfo()
         # #endif
@@ -1097,7 +1140,10 @@ class UDTBackedType(ExtendedType):
     # Must be overriden by subclasses to create the tinfo object.
     def _build_base_tinfo(self, **kwargs): raise UnimplementedExn
 
-    def _generate_udt_tinfo(self, elem_spec, is_union, requested_size=None, to_tinfo_kwargs=None):
+    @classmethod
+    def _generate_udt_tinfo(cls, elem_spec, is_union,
+                            requested_size=None,
+                            to_tinfo_kwargs=None):
         '''This function generates a UDT `tinfo_t` object.
 
         `elem_spec` specifies the elements of the UDT, and is a list of
@@ -1132,10 +1178,9 @@ class UDTBackedType(ExtendedType):
             udt_memb = udt_data.push_back()
 
             if offset < 0:
-                # XXX: Calculate offset automatically here, if specified.
-                offset = self._auto_calc_offset(prev_offset + prev_size, ty)
+                offset = cls._auto_calc_offset(prev_offset + prev_size, ty)
             elif offset < prev_offset:
-                raise InvalidUDTSpecExn("Specification offsets must be in asecnding order.")
+                raise InvalidUDTSpecExn("Specification offsets must be in asecending order.")
             #endif
            
             # Note: member offset is given in bits
@@ -1209,7 +1254,7 @@ class UDTBackedType(ExtendedType):
         modinfo = module.current().info
 
         # XXX: Test more, and add more conditions if necessary.
-        
+       
         if isinstance(ty, Primitive):
             if modinfo["8align4"] and ty._name in ("Int64", "UInt64", "Double"):
                 align = 4
@@ -1244,7 +1289,7 @@ class UDTBackedType(ExtendedType):
         return (elems, udt_data.total_size, udt_data.is_union)
 
     #enddef
-   
+    
 #endclass
 
 class Struct(UDTBackedType):
@@ -1253,6 +1298,13 @@ class Struct(UDTBackedType):
     Note: A C++ struct with associated methods will be considered a Class, not
     a Struct.
     '''
+
+    # Values of this enum map to index position of the specifier in the field tuple.
+    class FIELDSPEC(enum.Enum):
+        OFFSET = 0,
+        NAME = 1,
+        TYPE = 2
+    #endclass
     
     def __init__(self, fields, total_size = None,
                  **kwargs):
@@ -1260,8 +1312,8 @@ class Struct(UDTBackedType):
         :param fields: A list of 3-tuples of the form `(offset, name, ty)`.
             `offset` is the offset from the base of the struct. This list is
             identical to the one expected by `UDTBackedType._generate_udt_tinfo()`.
-        :param size_align: Align the size of this struct to `size_align`. Will
-            add padding bytes if necessary.
+        :param total_size: Size of this struct in bytes. Will add padding bytes
+            if necessary.
         '''
         self._fields = fields
         self._total_size = total_size
@@ -1272,8 +1324,19 @@ class Struct(UDTBackedType):
     def fields(self): return tuple(self._fields)
 
     @property
+    def total_size(self): return self._total_size
+    
+    @property
     def components(self): return tuple(set((ty for (_, _, ty) in self._fields)))
 
+    def validate(self):
+        try:
+            self.to_base_tinfo()
+        except (InvalidUDTSpecExn, InvalidUDTSpecExn) as e:
+            raise InvalidFieldsExn("Invalid fields specification") from e
+        #endtry
+    #enddef            
+                          
     def _build_base_tinfo(self, **kwargs):
         (tinfo, sz, calced_offsets) = self._generate_udt_tinfo(
             self._fields,
@@ -1285,11 +1348,18 @@ class Struct(UDTBackedType):
         return (tinfo, sz)
     #enddef
 
+    def _ensure_calced_offsets(self):
+        if not hasattr(self, "_calced_offsets"):
+            self.to_base_tinfo()
+        #endif
+    #enddef
+    
     def get_calced_field_info(self):
-        '''Returns a list of 3-tuples of the form `(calced_offset, offset, name,
+        '''Returns a list of 4-tuples of the form `(calced_offset, offset, name,
         ty)`, where `calced_offset` is the actual calculated offset of the
         field, and the other values are the same as in `self.fields`.
         '''
+        self._ensure_calced_offsets()
         return [
             (self._calced_offsets[name], offset, name, ty)
             for (offset, name, ty)
@@ -1297,7 +1367,10 @@ class Struct(UDTBackedType):
         ]
     #enddef
 
-    def get_calced_offset_of_field(self, field): return self._calced_offsets[field]
+    def get_calced_offset_of_field(self, field):
+        self._ensure_calced_offsets()
+        return self._calced_offsets[field]
+    #enddef
     
     def find_field_at_offset(self, offset, strict=True):
         '''Returns a 3-tuple (offset, name, ty) of the field at the specified offset,
@@ -1331,6 +1404,28 @@ class Struct(UDTBackedType):
         #endif
     #enddef    
 
+    def is_safe_to_add_field_at_offset(self, offset, ty):
+        '''Returns True iff adding a field of type `ty` at offset `offset`
+        will not overlap any existing fields.
+        '''
+        calced_fields = self.get_calced_field_info()
+        calced_fields.sort(key=lambda f: f[0])
+
+        range_start = offset
+        range_end = offset + ty.bytesize
+        
+        for (calced_offset, _, _, ty) in calced_fields:
+            field_start = calced_offset
+            field_end = calced_offset + ty.bytesize
+            if (range_end <= field_start) or (range_start >= field_end):
+                continue
+            else:
+                return False
+            #endif
+        #endfor
+        return True
+    #enddef
+    
     def find_field_by_name(self, field_name):
         # XXX: Should we provide the calculated offset of the field as well?
         
@@ -1346,6 +1441,131 @@ class Struct(UDTBackedType):
 
     #enddef    
 
+    def has_field_with_name(self, field_name):
+        for (_, n, _) in self._fields:
+            if field_name == n: return True
+        #endfor
+        return False
+    #enddef
+    
+    def extend(self, new_fields, new_size=None):
+
+        '''Returns a new, transient Struct type that consists of the fields of this
+        type extended with the additional fields in `new_fields`. 
+        '''
+
+        final_fields = []
+
+        pos = 0
+        for (offset, name, ty) in self._fields:
+            while pos < len(new_fields) and new_fields[pos][0] < offset:
+                final_fields.append(new_fields[pos])
+                pos += 1
+            #endwhile
+            final_fields.append((offset, name, ty))
+        #endfor
+
+        if pos < len(new_fields):
+            final_fields += new_fields[pos:]
+        #endif
+
+        if new_size == None and self._total_size != None:
+            if len(final_fields) > 0 and (final_fields[-1][0] + final_fields[-1][2].bytesize) >= self._total_size:
+                # The new fields extend beyond the previously set size. Leave
+                # new_size as None, so the size gets recalculated.
+                pass
+            else:
+                new_size = self._total_size
+            #endif
+        #endif
+        
+        return self.__class__(final_fields, total_size=new_size, transient=True)
+        
+    #enddef
+    
+    def remove_field(self, field_idx, new_size=None):
+
+        final_fields = self._fields[:field_idx] + self._fields[field_idx+1:]
+
+        if new_size != None:
+            total_size = new_size
+        else:
+            total_size = self._total_size
+        #endif
+        
+        return self.__class__(final_fields, total_size=total_size, transient=True)        
+
+    #enddef
+    
+    def modify(self, field_idx, field_spec, value,
+               preserve_size=True):
+        '''Returns a new, transient Struct type that consists of the fields of
+        this type, but with the field at index `field_idx` modified such that
+        the field specifier `field_spec` has new value `value`. If
+        `preserve_size` is True and the modification causes the resultant size
+        to exceed the previously defined total size, raise an
+        Exception. Otherwise, total size will be adjusted if necessary.
+        '''
+       
+        new_fields = list(self.fields)
+        new_size = self._total_size if preserve_size else None
+        recalc_offset = False
+        (offset, name, ty) = new_fields[field_idx]
+        match field_spec:
+            case Struct.FIELDSPEC.OFFSET:
+                offset = int(value)
+                # Don't recalculate if the offset is negative, i.e. automatic.
+                if offset >= 0: recalc_offset = True
+            case Struct.FIELDSPEC.NAME:
+                name = str(value)
+            case Struct.FIELDSPEC.TYPE:
+                ty = value
+            case _:
+                raise InvalidFieldSpecExn("Unknown field specifier {!r}".format(field_spec))
+        #endmatch
+
+        if self._total_size != None and offset + ty.bytesize > self._total_size:
+            if preserve_size:
+                raise CannotPreserveSizeExn("Struct modification for field at index {:d} to {!r} cannot preserve total size of {:d}.".format(field_idx, (offset, name, ty), self._total_size))
+            else:
+                # Modified offset exceeds current size, so don't set
+                # total_size, let it be recalculated.
+                new_size = None
+            #endif
+        else:
+            new_size = self._total_size
+        #endif
+
+        if recalc_offset:
+            # This was an offset change, we might need to reposition the field
+            # in the list to maintain sorted order. To do this easily, we
+            # generate a temp Struct type without the modified field, and then
+            # use Struct.extend() to add the modified field in the right
+            # position.
+            del new_fields[field_idx]
+            temp = self.__class__(new_fields, total_size=new_size, transient=True)
+            return temp.extend([(offset, name, ty)])
+        else:
+            # Set to new values directly.
+            new_fields[field_idx] = (offset, name, ty)
+        #endif
+
+        return self.__class__(new_fields, total_size=new_size, transient=True)
+                
+    #enddef
+
+    def modify_size(self, new_size):
+        if new_size != None:
+            calced_fields = self.get_calced_field_info()
+            (last_offset, _, _, last_ty) = calced_fields[-1]
+            if new_size < last_offset + last_ty.bytesize:
+                raise InvalidSizeExn("Modified size of {:d} is too small; field specification requires minimum size of {:d}.".format(new_size, last_offset + last_ty.bytesize))
+            #endif
+        #endif
+        return self.__class__(self.fields, total_size=new_size, transient=True)
+    #enddef
+    
+    
     def _build_properties_json(self):
         spec = [(offset, name, ty._to_json()) for (offset, name, ty) in self._fields]
         return {"spec" : spec, "sz": self._total_size}
@@ -1376,7 +1596,63 @@ class Struct(UDTBackedType):
     
 #endclass
 
-class Union(UDTBackedType): pass
+class Union(UDTBackedType):
+    '''C-style unions.
+    '''
+    
+    def __init__(self, alternates, **kwargs):
+        '''
+        :param alternates: A list of 2-tuples of the form `(name, ty)`, one
+        for each possible alternate type of this union.
+        '''
+        self._alternates = alternates
+        super().__init__(**kwargs)
+    #enddef
+
+    @property
+    def alternates(self): return tuple(self._alternates)
+
+    @property
+    def components(self): return tuple(set((ty for (_, ty) in self._alternates)))
+
+    def _build_base_tinfo(self, **kwargs):
+        (tinfo, sz, _) = self._generate_udt_tinfo(
+            [(0, name, ty) for (name, ty) in self._alternates],
+            is_union=True,
+            to_tinfo_kwargs=kwargs
+        )
+        return (tinfo, sz)
+    #enddef
+
+    def _build_properties_json(self):
+        spec = [(name, ty._to_json()) for (name, ty) in self._alternates]
+        return {"spec" : spec}
+    #enddef
+
+    @classmethod
+    def _from_properties_json(cls, obj):
+        alternates = [
+            (name, WilType._from_json(jsonty))
+            for (name, jsonty)
+            in obj["spec"]
+        ]
+        return super()._build_subclass_from_properties_json(
+            obj,
+            cls,
+            alternates
+        )
+    #enddef
+
+    @classmethod
+    def _build_from_tinfo(cls, tinfo, **kwargs):
+        if not tinfo.is_udt() or not tinfo.is_union(): return None
+        (elem_spec, _, _) = cls._elem_spec_from_tinfo(tinfo, **kwargs)
+        # Always return a transient extended type.
+        return cls([(name, ty) for (_, name, ty) in elem_spec], transient=True)
+    #enddef
+    
+#endclass
+
 
 ####################
 # UTILITY FUNCTIONS
@@ -1405,14 +1681,19 @@ class TypeContextStorage(storage.Storage):
     #enddef
 
     def add(self, qns, ty):
-        print("Called TypeContextStorage.add: {!r} -> {!r}".format(qns, ty))
+        DINFO("TypeContextStorage.add: {!r} -> {!r}".format(qns, ty))
         self.strmap[qns] = ty.serialize()
     #enddef
 
+    def remove(self, qns):
+        DINFO("TypeContextStorage.remove: {!r}".format(qns))
+        del self.strmap[qns]
+    #enddef
+    
     def get(self, qns): return WilType.unserialize(self.strmap[qns])
     
     def rename(self, old_qns, new_qns):
-        print("Called TypeContextStorage.rename")
+        DINFO("TypeContextStorage.rename: {!r} to {!r}".format(old_qns, new_qns))
         self.strmap[new_qns] = self.strmap[old_qns]
         del self.strmap[old_qns]
     #enddef
@@ -1423,8 +1704,9 @@ class TypeContextStorage(storage.Storage):
 
 class TypeName(qname.QName):
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, touched=False, **kwargs):
         super().__init__(*args, **kwargs)
+        self._touched = touched
     #enddef
 
     def _find_ida_ordinal(self):
@@ -1434,9 +1716,20 @@ class TypeName(qname.QName):
         ordinal = ti.get_ordinal()       
         return ordinal
     #enddef
+
+    @property
+    def is_touched(self): return self._touched
+    
+    def mark_touched(self, touched):
+        self._touched = touched
+    #enddef
     
     # Updates IDA's local type library with the type associated with this name.
     def _update_ida(self):
+
+        # Do not update if type is untouched.
+        if not self.is_touched: return
+
         ty = self.entity
         if isinstance(ty, ExtendedType):
             # Always use to_base_tinfo() to update from extended types
@@ -1451,7 +1744,7 @@ class TypeName(qname.QName):
         tinfo.set_numbered_type(idaapi.cvar.idati, ordinal, idaapi.NTF_REPLACE, self.fullname)
 
         if isinstance(ty, ExtendedType) and ty.is_transient:
-            # Mark extended type as persistent now that it is in the context.
+            # Mark extended type as persistent now that it has an associated IDA type.
             ty._mark_as_persistent(tinfo.get_ordinal(), tinfo.get_type_name())
         #endif
     #enddef  
@@ -1478,18 +1771,23 @@ class TypeContext(qname.Context):
         self.root.add_relay_event_observer(self._observer)
     #enddef
 
-    def add(self, ty, qns=None, caused_by=None, _do_not_add_to_ida=False, **kwargs):
+    def add(self, qns, ty,
+            caused_by=None,
+            touched=True,
+            _do_not_create_idaname=False,            
+            **kwargs):
+
         '''Add a new type to the typename context.
         '''
 
-        print("Called add.")
+        DINFO("Adding new type {!r} to typing context, qname = {!r}:".format(ty, qns))
         
         if isinstance(ty, ExtendedType) and not ty.is_transient:
             # This type is already persistent and has a name. Link it to
             # the requested name using a NamedRef instead.
             orig_ty = ty
             ty = NamedRef(self.locate(orig_ty.idaname))
-            print("Changed ty to NamedRef.")
+            DINFO("\tChanged type to NamedRef.")
         #endif
 
         if qns == None:
@@ -1506,9 +1804,15 @@ class TypeContext(qname.Context):
             raise DuplicateNameExn("Type name {} already exists in context.".format(qns))
         #endif
 
+        # Mark typename as touched or not.
+        qn.mark_touched(touched)
+        
         # This should only be used internally by sync(); otherwise the
         # type context and IDA's local type library will go out of sync.
-        if _do_not_add_to_ida: return
+        if _do_not_create_idaname:
+            DINFO("\tNot creating new IDA type, as requested.")
+            return
+        #endif
         
         # XXX: Should we stop here for polymorphic types?
 
@@ -1520,6 +1824,7 @@ class TypeContext(qname.Context):
 
         # First we get a new ordinal.
         ordinal = idaapi.alloc_type_ordinal(idaapi.cvar.idati)
+        DINFO("\tAllocated ordinal for IDA type: {}".format(ordinal))
 
         # Temporarily populate the type associated with the ordinal/name with
         # a dummy value.
@@ -1533,74 +1838,99 @@ class TypeContext(qname.Context):
 
         # Update storage as well.
         qn._update_storage()
-       
+
+        DINFO("\tUpdated IDA and storage.")
+        
         return qn
 
     #enddef
 
     def update(self, qns, new_ty):
-        self.locate(qns).entity = new_ty
+        qn = self.locate(qns)
+        qn.entity = new_ty
+    #enddef
+
+    def remove(self, qns):
+        qn = self.locate(qns)
+        qn.parent.remove_child(qn.basename)
+        # Further processing occurs in RemoveChild event handler _do_remove().
     #enddef
     
-    def _do_rename(self, qname, old_name, new_name):
+    def _do_remove(self, qn):
+        # Mark as transient if this was an ExtendedType
+        if isinstance(qn.entity, ExtendedType):
+            qn.entity._mark_as_transient()
+        #endif
+
+        # Remove from storage
+        self._storage.remove(qn.fullname)
+        # Remove from IDA type library
+        ordinal = idaapi.get_type_ordinal(idaapi.cvar.idati, qn.fullname)
+        idaapi.del_numbered_type(idaapi.cvar.idati, ordinal)
+    #enddef
+    
+    def _do_rename(self, qn, old_name, new_name):
         # Update storage.
         self._storage.rename(old_name, new_name)
         # Update IDA type library.
         util.rename_ida_type(old_name, new_name)
         # Inform extended type about name change.
-        if isinstance(qname.entity, ExtendedType):
-            qname.entity._idaname = new_name
+        if isinstance(qn.entity, ExtendedType):
+            qn.entity._idaname = new_name
         #endif
     #enddef
 
-    def _do_entity_change(self, qname, old_entity):
+    def _do_entity_change(self, qn, old_entity):
 
         # Ignore if this is the first time the entity is set, as we handle
         # this specifically inside add().
         if old_entity == None: return
 
+        # Name has been modified, so mark as touched.
+        qn.mark_touched(True)
+        
         # Update IDA type library.
-        qname._update_ida()
+        qn._update_ida()
       
         # Update storage.
-        qname._update_storage()
+        qn._update_storage()
       
         # Do cleanup for old entity if required.
-        if qname.entity != old_entity and isinstance(old_entity, ExtendedType):
-            print("Cleaning up old entity.")
+        if qn.entity != old_entity and isinstance(old_entity, ExtendedType):
+            DBG("_do_entity_change: Cleaning up old entity")
             old_entity._mark_as_transient()
         #endif
             
     #enddef
-    
+   
     def _observer(self, bearing, ev):
-        if isinstance(ev, qname.AddChildEvent):
-            qns = ev.parent[ev.childname].fullname
-            # XXX: Think we don't need to do anything here, since we need to
-            # wait for the EntityChangeEvent to get hold of the assigned type
-            # to add it to the storage. Confirm this and remove this clause if
-            # so.
-            pass            
-        elif isinstance(ev, qname.RemoveChildEvent):
-            # XXX: Handle
-            print("XXX Observed RemoveChildEvent in type context.")
-        elif isinstance(ev, qname.RenameEvent):
-            self._do_rename(ev.qname, ev.get_old_fullname(), ev.qname.fullname)
-        elif isinstance(ev, qname.ChildMoveEvent):
-            # This event gets emitted twice, once by each parent, so we make
-            # sure to only apply it once.
-            old_fullname = ev.get_old_fullname()
-            if self._storage.has_name(old_fullname):
-                self._do_rename(ev.qname, old_fullname, ev.qname.fullname)
-            #endif
-        elif isinstance(ev, qname.EntityChangeEvent):
-            self._do_entity_change(ev.qname, ev.old_entity)
-        #endif
-    #enddef
+        match ev:
+            case qname.AddChildEvent(parent, childname):
+                qns = parent[childname].fullname
+                # XXX: Think we don't need to do anything here, since we need
+                # to wait for the EntityChangeEvent to get hold of the
+                # assigned type to add it to the storage. Confirm this and
+                # remove this clause if so.                
 
-    
-    # XXX: Implement
-    # Add types found in IDA's local type library into this context.
+            case qname.RemoveChildEvent(parent, childname):
+                self._do_remove(parent[childname])
+            
+            case qname.RenameEvent(qn, _):
+                self._do_rename(qn, ev.get_old_fullname(), qn.fullname)
+                
+            case qname.ChildMoveEvent(qn, _, _, _, _):
+                # This event gets emitted twice, once by each parent, so we make
+                # sure to only apply it once.
+                old_fullname = ev.get_old_fullname()
+                if self._storage.has_name(old_fullname):
+                    self._do_rename(qn, old_fullname, qn.fullname)
+                #endif
+
+            case qname.EntityChangeEvent(qn, old_entity):
+                self._do_entity_change(qn, old_entity)
+                
+        #endmatch
+    #enddef
 
     def all_typenames(self):
         return (d
@@ -1611,13 +1941,15 @@ class TypeContext(qname.Context):
     def all_types(self): return (d.entity for d in self.all_typenames())
     
     def update_all_types(self):
-        print("Updating all types.")
+        DINFO("Updating all types:")
         for tyname in self.all_typenames():
-            print("Updating {}:".format(tyname.fullname))
+            DINFO("\tUpdating {}".format(tyname.fullname))
+            DBG("\t\tEnsuring forward references have been resolved.")
+            tyname.entity.ensure_resolve_forward_refs()
+            DBG("\t\tUpdating IDA.")
             tyname._update_ida()
-            print("\tIDA updated.")
+            DBG("\t\tUpdate storage.")
             tyname._update_storage()
-            print("\tStore updated.")
         #endfor
     #enddef
     
@@ -1663,21 +1995,16 @@ class TypeContext(qname.Context):
         #   - Else:
         #     - Generate a WilType from the tinfo
         #       - Use forward refs.
-        #       - XXX: Check out the forward refs code and make sure things
-        #         make sense. Clean out unneeded options in from_tinfo() as
-        #         well.
         #     - Add WilType to context, without updating IDA
         # - At this point, all new type information within IDA has been added
         #   to the context.
-        # - All names references by WilTypes also exist both in the context
+        # - All names referenced by WilTypes also exist both in the context
         #   and in IDA, so references can be resolved.
         # - We can then get all TypeNames to update IDA.
         #
-        # # XXX: Check situation wrt the storage also, we probably need to
-        #   update storage at the end of the sync as well.
-        #
-        #
 
+        DINFO("Syncing type context with IDA:")
+        
         maxord = idaapi.get_ordinal_qty(idaapi.cvar.idati)
 
         for i in range(1, maxord):
@@ -1687,11 +2014,11 @@ class TypeContext(qname.Context):
             if not found: continue
 
             tyname = tinfo.get_type_name()
-            print("Processing type: {}".format(tyname))
+            DINFO("\tProcessing type {}.".format(tyname))
 
             # Skip if a type of this name already exists in the context.
             if tyname in self:
-                print("\tAlready in context, skipping.")
+                DINFO("\t\tAlready in context, skipping.")
                 continue
             #endif
 
@@ -1701,18 +2028,23 @@ class TypeContext(qname.Context):
                                         ignore_toplevel_ref=True,
                                         use_forward_refs=True,
                                         do_not_resolve=True)
-                print("\tGot type: {!r}".format(ty))
+                DBG("\t\tGot type: {!r}".format(ty))
 
-                self.add(ty, qns=tyname, _do_not_add_to_ida=True)
-                print("\tAdded.")
+                self.add(tyname, ty, touched=False, _do_not_create_idaname=True)
+                DBG("\t\tAdded.")
+                if isinstance(ty, ExtendedType):
+                    DBG("\t\tMarking as persistent.")
+                    ty._mark_as_persistent(i, tyname)
+                #endif
+                
             except TInfoConversionExn:
-                print("\tCould not convert to WilType, skipping.")
+                DINFO("\t\tCould not convert to WilType, skipping.")
                 continue
             #endtry
 
         #endfor
 
-        print("Going to update all types now.")
+        DINFO("\tGoing to update all types now.")
         self.update_all_types()
         
     #enddef

@@ -57,6 +57,7 @@ class QNameEvent(event.Event):
 
 class AddChildEvent(QNameEvent):
     '''Triggered after the child is added.'''
+    __match_args__ = ("parent", "childname")
     def __init__(self, ctx, parent, childname, **kwargs):
         super().__init__(ctx, **kwargs)
         self.parent = parent
@@ -66,6 +67,7 @@ class AddChildEvent(QNameEvent):
 
 class RemoveChildEvent(QNameEvent):
     '''Triggered before the child is removed.'''
+    __match_args__ = ("parent", "childname")
     def __init__(self, ctx, parent, childname, **kwargs):
         super().__init__(ctx, **kwargs)
         self.parent = parent
@@ -75,6 +77,7 @@ class RemoveChildEvent(QNameEvent):
 
 class OrphanEvent(QNameEvent):
     '''Triggered before a qname is orphaned (deleted).'''
+    __match_args__ = ("qname")
     def __init__(self, ctx, qname, **kwargs):
         super().__init__(ctx, **kwargs)
         self.qname = qname
@@ -83,6 +86,7 @@ class OrphanEvent(QNameEvent):
 
 class RenameEvent(QNameEvent):
     '''Triggered after a qname is renamed.'''
+    __match_args__ = ("qname", "old_name", "new_name")
     def __init__(self, ctx, qname, old_name, new_name, **kwargs):
         super().__init__(ctx, **kwargs)
         self.qname = qname
@@ -100,6 +104,7 @@ class ChildMoveEvent(QNameEvent):
     '''Triggered after a qname is moved from one parent to another, and
     optionally renamed.
     This event will be emitted by both the old parent and the new parent.'''
+    __match_args__ = ("qname", "old_parent", "new_parent", "old_name", "new_name")
     def __init__(self, ctx, qname, old_parent, new_parent, old_name, new_name, **kwargs):
         super().__init__(ctx, **kwargs)
         self.qname = qname
@@ -117,6 +122,7 @@ class ChildMoveEvent(QNameEvent):
 
 class EntityChangeEvent(QNameEvent):
     '''Triggered whenever a qname's entity is set.'''
+    __match_args__ = ("qname", "old_entity")
     def __init__(self, ctx, qname, old_entity, **kwargs):
         super().__init__(ctx, **kwargs)
         self.qname = qname
@@ -143,6 +149,9 @@ class Root(event.Relay):
 
     def _join(self, s): return s
 
+    @property
+    def context(self): return self._ctx
+    
     @BRG_PARENT.adjacents_property
     def parent(self): return None
     
@@ -650,7 +659,7 @@ class Context(object):
 
     #enddef
 
-    def auto_name(self, prefix=""): return self._root.auto_child(prefix=prefix)
+    def auto_name(self, prefix=""): return self._root.auto_child(prefix=prefix, child_cls=self._qncls)
     
     def __getitem__(self, key):
         v = self._locate(key, build=False)

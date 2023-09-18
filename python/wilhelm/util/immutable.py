@@ -8,7 +8,7 @@ class Exn(Exception): pass
 class ImmutableExn(Exn): pass
 
 
-class immdict(collections.Mapping):
+class immdict(collections.abc.Mapping):
 
     def __init__(self, d):
         self._backing_dict = d

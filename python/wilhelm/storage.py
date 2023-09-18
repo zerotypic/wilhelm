@@ -20,7 +20,7 @@ def _normalize_value(v):
     #endif
 #enddef    
 
-class _IntMap(collections.MutableMapping):
+class _IntMap(collections.abc.MutableMapping):
 
     def __init__(self, netnode):
         self._netnode = netnode
@@ -66,7 +66,7 @@ class _IntMap(collections.MutableMapping):
         
 #endclass
 
-class _StrMap(collections.MutableMapping):
+class _StrMap(collections.abc.MutableMapping):
 
     def __init__(self, netnode):
         self._netnode = netnode
@@ -120,7 +120,7 @@ class Storage(object):
     IDA Pro netnodes.
     '''
 
-    PREFIX = "$wilhelm."
+    PREFIX = "$ wilhelm."
     
     def __init__(self, name):
         self._name = name
